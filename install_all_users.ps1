@@ -14,9 +14,13 @@ if (-not $isAdmin) {
     exit 0
 }
 
-$exeSrc = Join-Path $PSScriptRoot "target\release\hdr-snip.exe"
-if (-not (Test-Path $exeSrc)) {
-    Write-Error "Executavel nao encontrado em $exeSrc. Rode 'cargo build --release' primeiro."
+$exeCandidates = @(
+    (Join-Path $PSScriptRoot "hdr-snip.exe"),
+    (Join-Path $PSScriptRoot "target\release\hdr-snip.exe")
+)
+$exeSrc = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $exeSrc) {
+    Write-Error "Executavel hdr-snip.exe nao encontrado ao lado do script nem em target\release\. Baixe da Release ou rode 'cargo build --release'."
 }
 
 $installDir = "C:\ProgramData\hdr-snip"

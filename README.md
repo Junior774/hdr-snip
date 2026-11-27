@@ -13,7 +13,14 @@ Utilitário nativo e levíssimo (~1–2 MB, ~4 MB RAM em repouso, 0% CPU) em Rus
 - Dentro do recorte: **`Ctrl+C`** / **`Enter`** / **duplo clique** (copia), **`Ctrl+S`** (salva PNG), **`F`** (tela toda), **`Esc`** / **botão direito** (cancela).
 - Ícone na bandeja do sistema: clique esquerdo captura na hora; clique direito mostra status HDR ao vivo, pausar atalhos e sair.
 
-## Compilar e instalar para todos os usuários do PC
+## Instalar após formatar o PC (sem precisar instalar Rust!)
+1. Baixe `hdr-snip.exe` e `install_all_users.ps1` na aba **Releases** deste repositório na mesma pasta.
+2. Rode no PowerShell:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_all_users.ps1
+```
+
+## Ou compilar do zero e instalar para todos os usuários
 ```powershell
 cargo build --release
 .\install_all_users.ps1
