@@ -1,9 +1,3 @@
-//! Pure-Rust analytical SDF anti-aliased 2D renderer for 32-bit BGRA top-down DIBs.
-//!
-//! Zero external dependencies — renders smooth rounded capsules, soft elevation
-//! shadows, crisp 1px contrast borders, L-bracket crop handles, and Lucide-style
-//! vector icons directly onto the offscreen overlay backbuffer in < 0.5 ms.
-
 #[derive(Debug, Clone, Copy)]
 pub struct Rgba {
     pub r: u8,
@@ -70,7 +64,6 @@ impl<'a> Canvas<'a> {
         out + inside - r
     }
 
-    /// Draws a smooth analytical drop shadow behind a rounded rectangle.
     pub fn draw_soft_shadow(
         &mut self,
         x: f32,
@@ -107,7 +100,7 @@ impl<'a> Canvas<'a> {
                     continue;
                 }
                 let t = (1.0 - sd.max(0.0) * inv_blur).clamp(0.0, 1.0);
-                // Smooth cubic falloff mimics a crisp Gaussian shadow
+
                 let falloff = t * t * (3.0 - 2.0 * t);
                 let cov = max_alpha * falloff * falloff;
                 self.blend_px(px, py, black, cov);
@@ -115,7 +108,6 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Fills an anti-aliased rounded rectangle.
     pub fn fill_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, col: Rgba) {
         if w <= 0.0 || h <= 0.0 || col.a == 0 {
             return;
@@ -143,7 +135,6 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Strokes an inner-aligned anti-aliased border around a rounded rectangle.
     pub fn stroke_round_rect(
         &mut self,
         x: f32,
@@ -182,7 +173,6 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Draws an anti-aliased solid circle.
     pub fn fill_circle(&mut self, cx: f32, cy: f32, radius: f32, col: Rgba) {
         let x0 = ((cx - radius - 1.0).floor() as i32).max(0);
         let y0 = ((cy - radius - 1.0).floor() as i32).max(0);
@@ -202,7 +192,6 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Draws a fast axis-aligned crisp rectangle (great for 1px hairlines & crop borders).
     pub fn fill_rect_i32(&mut self, x: i32, y: i32, w: i32, h: i32, col: Rgba) {
         if w <= 0 || h <= 0 || col.a == 0 {
             return;
@@ -218,7 +207,6 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Draws an anti-aliased round-capped line segment via exact capsule SDF.
     pub fn draw_line_aa(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, col: Rgba) {
         let half_t = thickness * 0.5;
         let pad = half_t + 1.5;
@@ -256,14 +244,9 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    // =========================================================================
-    // Crisp Lucide-style vector icons (scaled by `s` for Per-Monitor DPI)
-    // =========================================================================
-
-    /// Copy icon: front rounded square + back L-frame behind top-left.
     pub fn draw_icon_copy(&mut self, cx: f32, cy: f32, s: f32, col: Rgba) {
         let t = (1.55 * s).max(1.2);
-        // Front rounded rect
+
         self.stroke_round_rect(
             cx - 2.0 * s,
             cy - 2.0 * s,
@@ -273,7 +256,7 @@ impl<'a> Canvas<'a> {
             t,
             col,
         );
-        // Back frame top + left edges
+
         let bx = cx - 5.2 * s;
         let by = cy - 5.2 * s;
         self.draw_line_aa(bx, by + 6.4 * s, bx, by + 1.4 * s, t, col);
@@ -281,39 +264,57 @@ impl<'a> Canvas<'a> {
         self.draw_line_aa(bx + 1.4 * s, by, bx + 6.4 * s, by, t, col);
     }
 
-    /// Save / Download icon: downward arrow into a minimal tray.
     pub fn draw_icon_save(&mut self, cx: f32, cy: f32, s: f32, col: Rgba) {
         let t = (1.55 * s).max(1.2);
-        // Arrow shaft + chevron
+
         self.draw_line_aa(cx, cy - 5.5 * s, cx, cy + 1.6 * s, t, col);
         self.draw_line_aa(cx - 3.0 * s, cy - 1.3 * s, cx, cy + 1.8 * s, t, col);
         self.draw_line_aa(cx + 3.0 * s, cy - 1.3 * s, cx, cy + 1.8 * s, t, col);
-        // Bottom tray U
-        self.draw_line_aa(cx - 5.4 * s, cy + 2.4 * s, cx - 5.4 * s, cy + 5.2 * s, t, col);
-        self.draw_line_aa(cx - 5.4 * s, cy + 5.2 * s, cx + 5.4 * s, cy + 5.2 * s, t, col);
-        self.draw_line_aa(cx + 5.4 * s, cy + 5.2 * s, cx + 5.4 * s, cy + 2.4 * s, t, col);
+
+        self.draw_line_aa(
+            cx - 5.4 * s,
+            cy + 2.4 * s,
+            cx - 5.4 * s,
+            cy + 5.2 * s,
+            t,
+            col,
+        );
+        self.draw_line_aa(
+            cx - 5.4 * s,
+            cy + 5.2 * s,
+            cx + 5.4 * s,
+            cy + 5.2 * s,
+            t,
+            col,
+        );
+        self.draw_line_aa(
+            cx + 5.4 * s,
+            cy + 5.2 * s,
+            cx + 5.4 * s,
+            cy + 2.4 * s,
+            t,
+            col,
+        );
     }
 
-    /// Fullscreen icon: 4 crisp corner brackets.
     pub fn draw_icon_fullscreen(&mut self, cx: f32, cy: f32, s: f32, col: Rgba) {
         let t = (1.55 * s).max(1.2);
         let d = 5.2 * s;
         let leg = 3.1 * s;
-        // Top-left
+
         self.draw_line_aa(cx - d, cy - d + leg, cx - d, cy - d, t, col);
         self.draw_line_aa(cx - d, cy - d, cx - d + leg, cy - d, t, col);
-        // Top-right
+
         self.draw_line_aa(cx + d - leg, cy - d, cx + d, cy - d, t, col);
         self.draw_line_aa(cx + d, cy - d, cx + d, cy - d + leg, t, col);
-        // Bottom-left
+
         self.draw_line_aa(cx - d, cy + d - leg, cx - d, cy + d, t, col);
         self.draw_line_aa(cx - d, cy + d, cx - d + leg, cy + d, t, col);
-        // Bottom-right
+
         self.draw_line_aa(cx + d - leg, cy + d, cx + d, cy + d, t, col);
         self.draw_line_aa(cx + d, cy + d, cx + d, cy + d - leg, t, col);
     }
 
-    /// Close icon: crisp symmetrical X.
     pub fn draw_icon_close(&mut self, cx: f32, cy: f32, s: f32, col: Rgba) {
         let t = (1.75 * s).max(1.3);
         let d = 4.0 * s;
@@ -321,7 +322,6 @@ impl<'a> Canvas<'a> {
         self.draw_line_aa(cx + d, cy - d, cx - d, cy + d, t, col);
     }
 
-    /// Return/Enter arrow icon (`↵`) for the primary keycap badge.
     pub fn draw_icon_return(&mut self, cx: f32, cy: f32, s: f32, col: Rgba) {
         let t = (1.35 * s).max(1.1);
         let rx = cx + 3.2 * s;
@@ -334,7 +334,6 @@ impl<'a> Canvas<'a> {
         self.draw_line_aa(lx, by, lx + 2.2 * s, by + 2.1 * s, t, col);
     }
 
-    /// Draws an L-shaped corner bracket with dark contrast halo for visibility on any screen.
     pub fn draw_corner_bracket(
         &mut self,
         corner_x: i32,
@@ -347,18 +346,23 @@ impl<'a> Canvas<'a> {
         let halo = Rgba::new(0, 0, 0, 190);
         let white = Rgba::rgb(255, 255, 255);
 
-        // Horizontal leg bounds
-        let hx = if dx > 0 { corner_x } else { corner_x - leg + thick };
+        let hx = if dx > 0 {
+            corner_x
+        } else {
+            corner_x - leg + thick
+        };
         let hy = if dy > 0 { corner_y } else { corner_y };
-        // Vertical leg bounds
-        let vx = if dx > 0 { corner_x } else { corner_x };
-        let vy = if dy > 0 { corner_y } else { corner_y - leg + thick };
 
-        // Dark outer halo (1px expansion)
+        let vx = if dx > 0 { corner_x } else { corner_x };
+        let vy = if dy > 0 {
+            corner_y
+        } else {
+            corner_y - leg + thick
+        };
+
         self.fill_rect_i32(hx - 1, hy - 1, leg + 2, thick + 2, halo);
         self.fill_rect_i32(vx - 1, vy - 1, thick + 2, leg + 2, halo);
 
-        // Crisp white foreground
         self.fill_rect_i32(hx, hy, leg, thick, white);
         self.fill_rect_i32(vx, vy, thick, leg, white);
     }

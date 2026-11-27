@@ -1,6 +1,3 @@
-//! Global low-level keyboard hook (`WH_KEYBOARD_LL`) for `PrintScreen` and `Win+Shift+S`,
-//! plus system tray icon & single-instance daemon loop.
-
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod capture;
@@ -12,7 +9,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, Ordering};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -53,8 +52,6 @@ fn is_key_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
 }
 
-/// Sends an unassigned virtual key (`0xE8`) so releasing `Win` after intercepting `Win+Shift+S`
-/// does NOT pop up the Windows Start Menu (same standard technique used by PowerToys/AutoHotkey).
 fn mask_win_key_start_menu() {
     let inputs = [
         INPUT {
@@ -88,7 +85,6 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let vk = VIRTUAL_KEY(kb.vkCode as u16);
 
-        // Swallow matching KEYUP for a hotkey we just consumed so foreground apps never see orphan KEYUP
         if (msg == WM_KEYUP || msg == WM_SYSKEYUP) && vk.0 != 0 {
             if SWALLOWED_VK
                 .compare_exchange(vk.0, 0, Ordering::SeqCst, Ordering::Relaxed)
@@ -107,9 +103,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
                 is_key_down(VK_SHIFT) || is_key_down(VK_LSHIFT) || is_key_down(VK_RSHIFT);
             let win_down = is_key_down(VK_LWIN) || is_key_down(VK_RWIN);
 
-            // 1) PrintScreen (without Alt — keep Win+Alt+PrtScn free for Xbox Game Bar if desired)
             let is_print_screen = vk == VK_SNAPSHOT && !alt_down;
-            // 2) Win + Shift + S
+
             let is_win_shift_s = vk == VK_S && win_down && shift_down && !alt_down;
 
             if is_print_screen || is_win_shift_s {
@@ -126,7 +121,7 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
                         LPARAM(0),
                     );
                 }
-                return LRESULT(1); // Swallow key so Snipping Tool / Lightshot does not also fire
+                return LRESULT(1);
             }
         }
     }
@@ -134,7 +129,6 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
     CallNextHookEx(hook, code, wparam, lparam)
 }
 
-/// Builds a crisp 16×16 tray icon in memory (no external .ico file needed).
 fn create_tray_icon() -> HICON {
     let w = 16usize;
     let h = 16usize;
@@ -147,25 +141,21 @@ fn create_tray_icon() -> HICON {
                 || (y == 4 || y == h - 5) && (x >= 4 && x <= w - 5);
             let center_dot = (x >= 7 && x <= 8) && (y >= 7 && y <= 8);
             if center_dot {
-                // Warm gold dot (HDR badge)
                 bgra[i] = 0x24;
                 bgra[i + 1] = 0xBF;
                 bgra[i + 2] = 0xFB;
                 bgra[i + 3] = 255;
             } else if inner_frame {
-                // Bright white crop frame
                 bgra[i] = 0xFF;
                 bgra[i + 1] = 0xFF;
                 bgra[i + 2] = 0xFF;
                 bgra[i + 3] = 255;
             } else if border {
-                // Sky blue border
                 bgra[i] = 0xF8;
                 bgra[i + 1] = 0xBD;
                 bgra[i + 2] = 0x38;
                 bgra[i + 3] = 255;
             } else {
-                // Deep navy fill
                 bgra[i] = 0x3A;
                 bgra[i + 1] = 0x1E;
                 bgra[i + 2] = 0x15;
@@ -176,7 +166,13 @@ fn create_tray_icon() -> HICON {
     unsafe {
         let color_bmp = CreateBitmap(w as i32, h as i32, 1, 32, Some(bgra.as_ptr() as *const _));
         let mask_bits = vec![0u8; w * h / 8];
-        let mask_bmp = CreateBitmap(w as i32, h as i32, 1, 1, Some(mask_bits.as_ptr() as *const _));
+        let mask_bmp = CreateBitmap(
+            w as i32,
+            h as i32,
+            1,
+            1,
+            Some(mask_bits.as_ptr() as *const _),
+        );
         let info = ICONINFO {
             fIcon: true.into(),
             xHotspot: 0,
@@ -251,14 +247,27 @@ fn show_tray_menu(hwnd: HWND) {
                 } else {
                     MF_UNCHECKED
                 };
-            let _ = AppendMenuW(menu, pause_flags, CMD_TOGGLE_PAUSE, PCWSTR(pause_w.as_ptr()));
+            let _ = AppendMenuW(
+                menu,
+                pause_flags,
+                CMD_TOGGLE_PAUSE,
+                PCWSTR(pause_w.as_ptr()),
+            );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, PCWSTR(exit_w.as_ptr()));
 
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let _ = SetForegroundWindow(hwnd);
-            let _ = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, None);
+            let _ = TrackPopupMenu(
+                menu,
+                TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                pt.x,
+                pt.y,
+                0,
+                hwnd,
+                None,
+            );
             let _ = DestroyMenu(menu);
         }
     }
@@ -330,7 +339,6 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    // CLI self-test mode: `hdr-snip.exe --test-capture <output.png>` (captures full screen and exits)
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--test-ui" {
         let out_path = PathBuf::from(&args[2]);
@@ -381,8 +389,9 @@ fn main() {
         }
     }
 
-    // Per-user single instance guard (allows multiple Windows users logged in simultaneously!)
-    let mutex_name: Vec<u16> = "Local\\HdrSnipSingleInstanceMutex\0".encode_utf16().collect();
+    let mutex_name: Vec<u16> = "Local\\HdrSnipSingleInstanceMutex\0"
+        .encode_utf16()
+        .collect();
     let _mutex = unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         return;

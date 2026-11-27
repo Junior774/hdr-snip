@@ -1,5 +1,3 @@
-//! Clipboard (CF_DIB + PNG) and Save-As PNG dialog helpers.
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
@@ -21,7 +19,6 @@ use crate::capture::CapturedScreen;
 
 const CF_DIB: u32 = 8;
 
-/// Encodes an RGBA8 image into an in-memory PNG byte buffer.
 pub fn encode_png_bytes(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity((width * height) as usize);
     {
@@ -35,7 +32,6 @@ pub fn encode_png_bytes(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// Saves a cropped region directly as PNG to `path`.
 pub fn save_crop_png(screen: &CapturedScreen, rect: RECT, path: &PathBuf) -> Result<(), String> {
     let (w, h, rgba) = screen.crop_rgba(rect);
     let file = File::create(path).map_err(|e| e.to_string())?;
@@ -48,17 +44,15 @@ pub fn save_crop_png(screen: &CapturedScreen, rect: RECT, path: &PathBuf) -> Res
     Ok(())
 }
 
-/// Places a cropped region onto the Windows clipboard as both `CF_DIB` (universal) and `"PNG"`.
 pub fn copy_crop_to_clipboard(screen: &CapturedScreen, rect: RECT) -> Result<(), String> {
     let (w, h, bgra_topdown) = screen.crop_bgra(rect);
     let (_, _, rgba) = screen.crop_rgba(rect);
     let png_bytes = encode_png_bytes(w, h, &rgba)?;
 
-    // Build bottom-up 32bpp BITMAPINFOHEADER + pixels for CF_DIB (maximum compatibility across apps)
     let hdr = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
         biWidth: w as i32,
-        biHeight: h as i32, // positive = bottom-up DIB
+        biHeight: h as i32,
         biPlanes: 1,
         biBitCount: 32,
         biCompression: BI_RGB.0,
@@ -74,7 +68,6 @@ pub fn copy_crop_to_clipboard(screen: &CapturedScreen, rect: RECT) -> Result<(),
         }
         let _ = EmptyClipboard();
 
-        // 1) Set CF_DIB
         if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, dib_total) {
             let ptr = GlobalLock(hmem) as *mut u8;
             if !ptr.is_null() {
@@ -95,7 +88,6 @@ pub fn copy_crop_to_clipboard(screen: &CapturedScreen, rect: RECT) -> Result<(),
             }
         }
 
-        // 2) Set registered "PNG" format for modern apps
         let fmt_name: Vec<u16> = "PNG\0".encode_utf16().collect();
         let cf_png = RegisterClipboardFormatW(PCWSTR(fmt_name.as_ptr()));
         if cf_png != 0 {
@@ -114,7 +106,6 @@ pub fn copy_crop_to_clipboard(screen: &CapturedScreen, rect: RECT) -> Result<(),
     Ok(())
 }
 
-/// Opens the native Windows Save-As dialog for PNG, defaulting to Pictures\Screenshots (or Pictures).
 pub fn prompt_save_png_dialog(owner: HWND) -> Option<PathBuf> {
     let default_name = unsafe {
         let st: SYSTEMTIME = GetLocalTime();
@@ -165,7 +156,10 @@ pub fn prompt_save_png_dialog(owner: HWND) -> Option<PathBuf> {
 
     unsafe {
         if GetSaveFileNameW(&mut ofn).as_bool() {
-            let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+            let len = file_buf
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(file_buf.len());
             return Some(PathBuf::from(String::from_utf16_lossy(&file_buf[..len])));
         }
     }

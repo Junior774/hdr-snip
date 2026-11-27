@@ -1,4 +1,3 @@
-# Remove o HDR Snip de TODOS os usuarios deste PC
 $ErrorActionPreference = "Stop"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(

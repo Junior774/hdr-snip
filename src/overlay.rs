@@ -1,18 +1,10 @@
-//! Keycap Minimal fullscreen crop overlay with native anti-aliased SDF rendering.
-//!
-//! Features:
-//! - Cached 32-bit DIB double-buffer (zero allocation on drag, zero flicker)
-//! - Pure-Rust analytical SDF anti-aliasing for rounded capsules, soft drop shadows,
-//!   double-contrast borders, L-bracket corner handles, and Lucide-style vector icons
-//! - Per-Monitor DPI scaling (stays crisp at 100%, 125%, 150%, 200% on any resolution)
-//! - Floating Keycap Minimal toolbar: Copiar [↵] · Salvar [S] · Tela [F] | ✕ [Esc]
-//! - Direct shortcuts (`Enter`/`C`/`Ctrl+C`, `S`/`Ctrl+S`, `F`, `Esc`) + double-click to copy
-
 use std::cell::RefCell;
 use std::path::Path;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject,
     DrawTextW, EndPaint, GdiFlush, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint,
@@ -29,26 +21,24 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
     GetWindowLongPtrW, LoadCursorW, RegisterClassW, SetCursor, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL,
-    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WM_CREATE, WM_DESTROY,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::CapturedScreen;
 use crate::clipboard::{copy_crop_to_clipboard, prompt_save_png_dialog, save_crop_png};
 use crate::ui_draw::{Canvas, Rgba};
 
-// Keycap Minimal palette
-const COL_SURFACE: Rgba = Rgba::new(17, 19, 23, 244); // #111317 @ 96%
-const COL_SURFACE_BORDER: Rgba = Rgba::new(255, 255, 255, 52); // white/20%
+const COL_SURFACE: Rgba = Rgba::new(17, 19, 23, 244);
+const COL_SURFACE_BORDER: Rgba = Rgba::new(255, 255, 255, 52);
 const COL_OUTER_HALO: Rgba = Rgba::new(0, 0, 0, 145);
 const COL_DIVIDER: Rgba = Rgba::new(255, 255, 255, 42);
 
-const COL_PRIMARY: Rgba = Rgba::rgb(5, 150, 105); // #059669 emerald-600
-const COL_PRIMARY_HOVER: Rgba = Rgba::rgb(16, 185, 129); // #10B981 emerald-500
+const COL_PRIMARY: Rgba = Rgba::rgb(5, 150, 105);
+const COL_PRIMARY_HOVER: Rgba = Rgba::rgb(16, 185, 129);
 const COL_PRIMARY_RIM: Rgba = Rgba::new(255, 255, 255, 46);
 const COL_PRIMARY_KBD_BG: Rgba = Rgba::new(0, 0, 0, 68);
 const COL_PRIMARY_KBD_BD: Rgba = Rgba::new(255, 255, 255, 72);
@@ -68,9 +58,9 @@ const COL_ICON_SEC: Rgba = Rgba::rgb(236, 239, 244);
 const COL_ICON_MUTED: Rgba = Rgba::rgb(203, 213, 225);
 const COL_ICON_ROSE: Rgba = Rgba::rgb(253, 164, 175);
 
-const COL_FRAME_LIGHT: Rgba = Rgba::new(229, 231, 235, 245); // #E5E7EB
+const COL_FRAME_LIGHT: Rgba = Rgba::new(229, 231, 235, 245);
 const COL_FRAME_DARK: Rgba = Rgba::new(0, 0, 0, 170);
-const COL_HDR_DOT: Rgba = Rgba::rgb(16, 185, 129); // #10B981
+const COL_HDR_DOT: Rgba = Rgba::rgb(16, 185, 129);
 
 const fn colorref(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
@@ -140,10 +130,26 @@ impl OverlayState {
 
     fn normalized_sel(&self) -> RECT {
         RECT {
-            left: self.sel.left.min(self.sel.right).clamp(0, self.screen.width as i32),
-            top: self.sel.top.min(self.sel.bottom).clamp(0, self.screen.height as i32),
-            right: self.sel.left.max(self.sel.right).clamp(0, self.screen.width as i32),
-            bottom: self.sel.top.max(self.sel.bottom).clamp(0, self.screen.height as i32),
+            left: self
+                .sel
+                .left
+                .min(self.sel.right)
+                .clamp(0, self.screen.width as i32),
+            top: self
+                .sel
+                .top
+                .min(self.sel.bottom)
+                .clamp(0, self.screen.height as i32),
+            right: self
+                .sel
+                .left
+                .max(self.sel.right)
+                .clamp(0, self.screen.width as i32),
+            bottom: self
+                .sel
+                .top
+                .max(self.sel.bottom)
+                .clamp(0, self.screen.height as i32),
         }
     }
 
@@ -200,7 +206,6 @@ impl OverlayState {
         let sw = self.screen.width as i32;
         let sh = self.screen.height as i32;
 
-        // Measure labels with the exact GDI fonts for crisp, zero-clipping alignment
         let tmp_dc = unsafe { CreateCompatibleDC(HDC::default()) };
         let w_copy = measure_text_w(tmp_dc, self.font_ui_bold, "Copiar");
         let w_save = measure_text_w(tmp_dc, self.font_ui_med, "Salvar");
@@ -236,7 +241,7 @@ impl OverlayState {
             Spec {
                 kind: ToolbarBtn::Copy,
                 label: "Copiar",
-                keycap: "", // vector return arrow
+                keycap: "",
                 label_w: w_copy,
                 kbd_w: self.px(21.0),
                 pad_l: self.px(11.0),
@@ -295,8 +300,8 @@ impl OverlayState {
             })
             .collect();
 
-        // Copy + gap + Save + gap + Full + div_slot + Cancel
-        let inner_w = btn_widths[0] + gap + btn_widths[1] + gap + btn_widths[2] + div_slot + btn_widths[3];
+        let inner_w =
+            btn_widths[0] + gap + btn_widths[1] + gap + btn_widths[2] + div_slot + btn_widths[3];
         let total_w = inner_w + pad_outer * 2;
         let bar_h = btn_h + pad_outer * 2;
         let margin = self.px(10.0);
@@ -366,18 +371,15 @@ impl OverlayState {
         None
     }
 
-    /// Renders the complete overlay frame into `self.bmp_back` using `mem_dc`.
     fn render_frame(&self, mem_dc: HDC, src_dc: HDC) {
         let w = self.screen.width as i32;
         let h = self.screen.height as i32;
         let s = self.scale;
 
         unsafe {
-            // 1) Dimmed full screen backdrop
             let old_src = SelectObject(src_dc, self.bmp_dim);
             let _ = BitBlt(mem_dc, 0, 0, w, h, src_dc, 0, 0, SRCCOPY);
 
-            // 2) Bright cropped region
             if self.sel_valid() {
                 let r = self.normalized_sel();
                 SelectObject(src_dc, self.bmp_bright);
@@ -397,13 +399,11 @@ impl OverlayState {
             let _ = GdiFlush();
         }
 
-        // 3) Pure-Rust anti-aliased SDF rendering pass on the 32-bit DIB backbuffer
         let slice = unsafe {
             std::slice::from_raw_parts_mut(self.back_bits, (w as usize) * (h as usize) * 4)
         };
         let mut canvas = Canvas::new(slice, w, h);
 
-        // Precompute top-hint layout or dimension-pill layout so text pass uses exact rects
         let mut dim_pill_info: Option<(RECT, String, bool)> = None;
         let mut hint_info: Option<HintLayout> = None;
 
@@ -412,7 +412,6 @@ impl OverlayState {
             let rw = r.right - r.left;
             let rh = r.bottom - r.top;
 
-            // Selection border: outer dark contrast halo + crisp bright #E5E7EB inner frame
             canvas.fill_rect_i32(r.left - 1, r.top - 1, rw + 2, 1, COL_FRAME_DARK);
             canvas.fill_rect_i32(r.left - 1, r.bottom, rw + 2, 1, COL_FRAME_DARK);
             canvas.fill_rect_i32(r.left - 1, r.top, 1, rh, COL_FRAME_DARK);
@@ -424,7 +423,6 @@ impl OverlayState {
             canvas.fill_rect_i32(r.left, r.top, bt, rh, COL_FRAME_LIGHT);
             canvas.fill_rect_i32(r.right - bt, r.top, bt, rh, COL_FRAME_LIGHT);
 
-            // Sleek white corner L-brackets with contrast shadow
             let leg = self.px(13.0).min(rw / 3).min(rh / 3).max(self.px(5.0));
             let thick = self.px(2.5).max(2);
             let out = self.px(1.0).max(1);
@@ -440,12 +438,17 @@ impl OverlayState {
                 thick,
             );
 
-            // Subtle midpoint edge bars when selection is large enough
             let mid_len = self.px(12.0);
             let mid_t = self.px(2.4).max(2);
             if rw >= self.px(76.0) {
                 let mx = (r.left + r.right - mid_len) / 2;
-                canvas.fill_rect_i32(mx - 1, r.top - out - 1, mid_len + 2, mid_t + 2, COL_FRAME_DARK);
+                canvas.fill_rect_i32(
+                    mx - 1,
+                    r.top - out - 1,
+                    mid_len + 2,
+                    mid_t + 2,
+                    COL_FRAME_DARK,
+                );
                 canvas.fill_rect_i32(mx, r.top - out, mid_len, mid_t, COL_ICON_WHITE);
                 canvas.fill_rect_i32(
                     mx - 1,
@@ -458,7 +461,13 @@ impl OverlayState {
             }
             if rh >= self.px(76.0) {
                 let my = (r.top + r.bottom - mid_len) / 2;
-                canvas.fill_rect_i32(r.left - out - 1, my - 1, mid_t + 2, mid_len + 2, COL_FRAME_DARK);
+                canvas.fill_rect_i32(
+                    r.left - out - 1,
+                    my - 1,
+                    mid_t + 2,
+                    mid_len + 2,
+                    COL_FRAME_DARK,
+                );
                 canvas.fill_rect_i32(r.left - out, my, mid_t, mid_len, COL_ICON_WHITE);
                 canvas.fill_rect_i32(
                     r.right + out - mid_t - 1,
@@ -470,7 +479,6 @@ impl OverlayState {
                 canvas.fill_rect_i32(r.right + out - mid_t, my, mid_t, mid_len, COL_ICON_WHITE);
             }
 
-            // Dimensions pill (auto-sized to text)
             let dim_str = format!("{} × {}", rw, rh);
             let hdr = self.screen.hdr_info.hdr_enabled;
             let dim_w = measure_text_w(mem_dc, self.font_mono, &dim_str);
@@ -542,14 +550,22 @@ impl OverlayState {
             }
             dim_pill_info = Some((pr, dim_str, hdr));
         } else {
-            // Matching Keycap Minimal top hint pill before first drag
             let hl = compute_hint_layout(self, mem_dc, w);
             let hr = hl.bar;
             let hw = (hr.right - hr.left) as f32;
             let hh = (hr.bottom - hr.top) as f32;
             let rad = 11.0 * s;
 
-            canvas.draw_soft_shadow(hr.left as f32, hr.top as f32, hw, hh, rad, 5.0 * s, 14.0 * s, 0.45);
+            canvas.draw_soft_shadow(
+                hr.left as f32,
+                hr.top as f32,
+                hw,
+                hh,
+                rad,
+                5.0 * s,
+                14.0 * s,
+                0.45,
+            );
             canvas.stroke_round_rect(
                 hr.left as f32 - 1.0,
                 hr.top as f32 - 1.0,
@@ -560,9 +576,16 @@ impl OverlayState {
                 COL_OUTER_HALO,
             );
             canvas.fill_round_rect(hr.left as f32, hr.top as f32, hw, hh, rad, COL_SURFACE);
-            canvas.stroke_round_rect(hr.left as f32, hr.top as f32, hw, hh, rad, 1.0, COL_SURFACE_BORDER);
+            canvas.stroke_round_rect(
+                hr.left as f32,
+                hr.top as f32,
+                hw,
+                hh,
+                rad,
+                1.0,
+                COL_SURFACE_BORDER,
+            );
 
-            // Keycap badges for [F] and [Esc] + subtle vertical dividers
             let div_h = self.px(14.0);
             let div_y = hr.top + (hr.bottom - hr.top - div_h) / 2;
             canvas.fill_rect_i32(hl.div1_x, div_y, 1, div_h, COL_DIVIDER);
@@ -571,21 +594,43 @@ impl OverlayState {
             for kr in [hl.kbd_f, hl.kbd_esc] {
                 let kw = (kr.right - kr.left) as f32;
                 let kh = (kr.bottom - kr.top) as f32;
-                canvas.fill_round_rect(kr.left as f32, kr.top as f32, kw, kh, 4.5 * s, COL_SEC_KBD_BG);
-                canvas.stroke_round_rect(kr.left as f32, kr.top as f32, kw, kh, 4.5 * s, 1.0, COL_SEC_KBD_BD);
+                canvas.fill_round_rect(
+                    kr.left as f32,
+                    kr.top as f32,
+                    kw,
+                    kh,
+                    4.5 * s,
+                    COL_SEC_KBD_BG,
+                );
+                canvas.stroke_round_rect(
+                    kr.left as f32,
+                    kr.top as f32,
+                    kw,
+                    kh,
+                    4.5 * s,
+                    1.0,
+                    COL_SEC_KBD_BD,
+                );
             }
             hint_info = Some(hl);
         }
 
-        // 4) Keycap Minimal Floating Toolbar (AA capsule, buttons, icons, keycaps)
         if !self.buttons.is_empty() {
             let br = self.bar_rect;
             let bw = (br.right - br.left) as f32;
             let bh = (br.bottom - br.top) as f32;
             let bar_rad = 12.0 * s;
 
-            // Elevation shadow + outer dark contrast ring + dark glass capsule + crisp inner 1px border
-            canvas.draw_soft_shadow(br.left as f32, br.top as f32, bw, bh, bar_rad, 6.0 * s, 15.0 * s, 0.50);
+            canvas.draw_soft_shadow(
+                br.left as f32,
+                br.top as f32,
+                bw,
+                bh,
+                bar_rad,
+                6.0 * s,
+                15.0 * s,
+                0.50,
+            );
             canvas.stroke_round_rect(
                 br.left as f32 - 1.0,
                 br.top as f32 - 1.0,
@@ -606,7 +651,6 @@ impl OverlayState {
                 COL_SURFACE_BORDER,
             );
 
-            // Hairline divider before Cancel
             let div_h = self.px(18.0);
             let div_y = br.top + (br.bottom - br.top - div_h) / 2;
             canvas.fill_rect_i32(self.divider_x, div_y, 1, div_h, COL_DIVIDER);
@@ -621,7 +665,6 @@ impl OverlayState {
                 let rw = (b.rect.right - b.rect.left) as f32;
                 let rh = (b.rect.bottom - b.rect.top) as f32;
 
-                // Button surface
                 match (b.kind, hovered) {
                     (ToolbarBtn::Copy, true) => {
                         canvas.fill_round_rect(rx, ry, rw, rh, btn_rad, COL_PRIMARY_HOVER);
@@ -642,27 +685,33 @@ impl OverlayState {
                     _ => {}
                 }
 
-                // Vector icon
                 let icon_cy = ry + rh * 0.5;
                 match b.kind {
-                    ToolbarBtn::Copy => canvas.draw_icon_copy(b.icon_cx, icon_cy, s, COL_ICON_WHITE),
+                    ToolbarBtn::Copy => {
+                        canvas.draw_icon_copy(b.icon_cx, icon_cy, s, COL_ICON_WHITE)
+                    }
                     ToolbarBtn::Save => canvas.draw_icon_save(b.icon_cx, icon_cy, s, COL_ICON_SEC),
                     ToolbarBtn::Full => {
                         canvas.draw_icon_fullscreen(b.icon_cx, icon_cy, s, COL_ICON_SEC)
                     }
                     ToolbarBtn::Cancel => {
-                        let col = if hovered { COL_ICON_ROSE } else { COL_ICON_MUTED };
+                        let col = if hovered {
+                            COL_ICON_ROSE
+                        } else {
+                            COL_ICON_MUTED
+                        };
                         canvas.draw_icon_close(b.icon_cx, icon_cy, s, col);
                     }
                 }
 
-                // Keycap pill
                 let kr = b.keycap_rect;
                 let kw = (kr.right - kr.left) as f32;
                 let kh = (kr.bottom - kr.top) as f32;
                 let (kbg, kbd) = match (b.kind, hovered) {
                     (ToolbarBtn::Copy, _) => (COL_PRIMARY_KBD_BG, COL_PRIMARY_KBD_BD),
-                    (ToolbarBtn::Cancel, true) => (COL_CANCEL_KBD_HOVER_BG, COL_CANCEL_KBD_HOVER_BD),
+                    (ToolbarBtn::Cancel, true) => {
+                        (COL_CANCEL_KBD_HOVER_BG, COL_CANCEL_KBD_HOVER_BD)
+                    }
                     _ => (COL_SEC_KBD_BG, COL_SEC_KBD_BD),
                 };
                 canvas.fill_round_rect(kr.left as f32, kr.top as f32, kw, kh, kbd_rad, kbg);
@@ -679,7 +728,6 @@ impl OverlayState {
             }
         }
 
-        // 5) Crisp ClearType text pass via GDI
         unsafe {
             SetBkMode(mem_dc, TRANSPARENT);
 
@@ -693,7 +741,12 @@ impl OverlayState {
                     right: pr.right,
                     bottom: pr.bottom,
                 };
-                draw_str(mem_dc, &dim_str, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                draw_str(
+                    mem_dc,
+                    &dim_str,
+                    &mut tr,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
 
                 if hdr {
                     let dim_w = measure_text_w(mem_dc, self.font_mono, &dim_str);
@@ -705,26 +758,51 @@ impl OverlayState {
                         right: pr.right,
                         bottom: pr.bottom,
                     };
-                    draw_str(mem_dc, "HDR→sRGB", &mut hr_t, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    draw_str(
+                        mem_dc,
+                        "HDR→sRGB",
+                        &mut hr_t,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                    );
                 }
                 SelectObject(mem_dc, old_f);
             } else if let Some(hl) = hint_info {
                 let old_f = SelectObject(mem_dc, self.font_ui_med);
                 SetTextColor(mem_dc, colorref(244, 246, 250));
                 let mut r1 = hl.txt_drag;
-                draw_str(mem_dc, "Arraste para recortar", &mut r1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                draw_str(
+                    mem_dc,
+                    "Arraste para recortar",
+                    &mut r1,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
                 SetTextColor(mem_dc, colorref(203, 213, 225));
                 let mut r2 = hl.txt_full;
-                draw_str(mem_dc, "Tela toda", &mut r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                draw_str(
+                    mem_dc,
+                    "Tela toda",
+                    &mut r2,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
                 let mut r3 = hl.txt_esc;
-                draw_str(mem_dc, "Sair", &mut r3, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                draw_str(
+                    mem_dc,
+                    "Sair",
+                    &mut r3,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
 
                 SelectObject(mem_dc, self.font_keycap);
                 SetTextColor(mem_dc, colorref(226, 232, 240));
                 let mut kf = hl.kbd_f;
                 draw_str(mem_dc, "F", &mut kf, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 let mut ke = hl.kbd_esc;
-                draw_str(mem_dc, "Esc", &mut ke, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                draw_str(
+                    mem_dc,
+                    "Esc",
+                    &mut ke,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
                 SelectObject(mem_dc, old_f);
             }
 
@@ -746,7 +824,12 @@ impl OverlayState {
                             right: b.keycap_rect.left,
                             bottom: b.rect.bottom,
                         };
-                        draw_str(mem_dc, b.label, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                        draw_str(
+                            mem_dc,
+                            b.label,
+                            &mut tr,
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                        );
                     }
                     if !b.keycap.is_empty() {
                         SelectObject(mem_dc, self.font_keycap);
@@ -757,7 +840,12 @@ impl OverlayState {
                         };
                         SetTextColor(mem_dc, col);
                         let mut kr = b.keycap_rect;
-                        draw_str(mem_dc, b.keycap, &mut kr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                        draw_str(
+                            mem_dc,
+                            b.keycap,
+                            &mut kr,
+                            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                        );
                     }
                 }
                 SelectObject(mem_dc, old_f);
@@ -815,19 +903,44 @@ fn compute_hint_layout(st: &OverlayState, dc: HDC, screen_w: i32) -> HintLayout 
     let ky = by + (bar_h - kbd_h) / 2;
 
     let mut cx = bx + pad_x;
-    let txt_drag = RECT { left: cx, top: by, right: cx + w_drag, bottom: by + bar_h };
+    let txt_drag = RECT {
+        left: cx,
+        top: by,
+        right: cx + w_drag,
+        bottom: by + bar_h,
+    };
     cx += w_drag + div_gap;
     let div1_x = cx;
     cx += 1 + div_gap;
-    let txt_full = RECT { left: cx, top: by, right: cx + w_full, bottom: by + bar_h };
+    let txt_full = RECT {
+        left: cx,
+        top: by,
+        right: cx + w_full,
+        bottom: by + bar_h,
+    };
     cx += w_full + kbd_gap;
-    let kbd_f = RECT { left: cx, top: ky, right: cx + w_kf, bottom: ky + kbd_h };
+    let kbd_f = RECT {
+        left: cx,
+        top: ky,
+        right: cx + w_kf,
+        bottom: ky + kbd_h,
+    };
     cx += w_kf + div_gap;
     let div2_x = cx;
     cx += 1 + div_gap;
-    let txt_esc = RECT { left: cx, top: by, right: cx + w_esc, bottom: by + bar_h };
+    let txt_esc = RECT {
+        left: cx,
+        top: by,
+        right: cx + w_esc,
+        bottom: by + bar_h,
+    };
     cx += w_esc + kbd_gap;
-    let kbd_esc = RECT { left: cx, top: ky, right: cx + w_ke, bottom: ky + kbd_h };
+    let kbd_esc = RECT {
+        left: cx,
+        top: ky,
+        right: cx + w_ke,
+        bottom: ky + kbd_h,
+    };
 
     HintLayout {
         bar,
@@ -872,7 +985,7 @@ fn create_topdown_dib(width: u32, height: u32, bgra: Option<&[u8]>) -> (HBITMAP,
         bmi.bmiHeader = BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width as i32,
-            biHeight: -(height as i32), // top-down
+            biHeight: -(height as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
@@ -893,7 +1006,6 @@ fn create_topdown_dib(width: u32, height: u32, bgra: Option<&[u8]>) -> (HBITMAP,
 fn make_dimmed_bgra(bgra: &[u8]) -> Vec<u8> {
     let mut dim = vec![0u8; bgra.len()];
     for (src, dst) in bgra.chunks_exact(4).zip(dim.chunks_exact_mut(4)) {
-        // Darken to ~44% brightness so the bright crop & toolbar pop cleanly
         dst[0] = ((src[0] as u16 * 112) >> 8) as u8;
         dst[1] = ((src[1] as u16 * 112) >> 8) as u8;
         dst[2] = ((src[2] as u16 * 112) >> 8) as u8;
@@ -974,7 +1086,10 @@ fn query_monitor_scale(mon_rect: RECT) -> f32 {
     }
 }
 
-fn build_overlay_state(screen: CapturedScreen, on_close: Option<Box<dyn FnOnce()>>) -> OverlayState {
+fn build_overlay_state(
+    screen: CapturedScreen,
+    on_close: Option<Box<dyn FnOnce()>>,
+) -> OverlayState {
     let scale = query_monitor_scale(screen.monitor_rect);
     let (bmp_bright, _) = create_topdown_dib(screen.width, screen.height, Some(&screen.bgra));
     let dim_bgra = make_dimmed_bgra(&screen.bgra);
@@ -1030,8 +1145,6 @@ fn build_overlay_state(screen: CapturedScreen, on_close: Option<Box<dyn FnOnce()
     }
 }
 
-/// Offline UI render self-test: draws the real Keycap Minimal overlay with a sample
-/// selection onto `screen` and saves it to `out_path` for visual inspection.
 pub fn render_ui_preview_png(screen: CapturedScreen, out_path: &Path) -> Result<(), String> {
     let w = screen.width;
     let h = screen.height;
@@ -1100,7 +1213,6 @@ fn ensure_overlay_class(hinst: HINSTANCE) {
     });
 }
 
-/// Opens the fullscreen Keycap Minimal crop overlay for `screen`.
 pub fn show_overlay(screen: CapturedScreen, on_close: impl FnOnce() + 'static) {
     let hinst: HINSTANCE = unsafe { GetModuleHandleW(None).unwrap_or_default().into() };
     ensure_overlay_class(hinst);

@@ -1,5 +1,4 @@
 ﻿# Instala o HDR Snip para TODOS os usuários deste PC (Windows 11)
-# Requer PowerShell como Administrador para escrever em C:\ProgramData\...\Startup.
 
 $ErrorActionPreference = "Stop"
 
@@ -28,17 +27,14 @@ $exeDst = Join-Path $installDir "hdr-snip.exe"
 $startupDir = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
 $lnkPath = Join-Path $startupDir "HDR Snip.lnk"
 
-# Encerra instancias anteriores antes de copiar o binario novo
 Get-Process -Name "hdr-snip" -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
 
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Copy-Item -Path $exeSrc -Destination $exeDst -Force
 
-# Garante permissao de leitura e execucao para TODOS os usuarios do PC
 icacls $installDir /grant "*S-1-5-32-545:(OI)(CI)RX" /T /Q | Out-Null
 
-# Cria atalho no Startup de TODOS os usuarios
 $wsh = New-Object -ComObject WScript.Shell
 $shortcut = $wsh.CreateShortcut($lnkPath)
 $shortcut.TargetPath = $exeDst
@@ -53,7 +49,6 @@ Write-Host "  Startup : $lnkPath"
 Write-Host ""
 Write-Host "Dica: se voce tinha o Lightshot aberto, feche/desative ele no Iniciar para nao brigar pelo PrintScreen." -ForegroundColor Cyan
 
-# Inicia imediatamente para a sessao atual
 Start-Process -FilePath $exeDst -WorkingDirectory $installDir
 Write-Host "HDR Snip iniciado na bandeja do sistema! Teste agora com PrintScreen ou Win+Shift+S." -ForegroundColor Green
 Write-Host ""

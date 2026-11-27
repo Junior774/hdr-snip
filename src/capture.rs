@@ -1,10 +1,3 @@
-//! Native Windows 11 HDR-aware screen capture via WinRT Windows.Graphics.Capture.
-//!
-//! When the target monitor has HDR enabled, captures into `R16G16B16A16Float` (linear scRGB),
-//! queries the monitor's exact `DISPLAYCONFIG_SDR_WHITE_LEVEL` multiplier (e.g. 240 nits = 3.0x),
-//! divides back to normalized `[0.0, 1.0]` SDR linear light, and encodes exact sRGB via a 16K LUT.
-//! Pure SDR white stays exactly `255` (never washed-out gray like Snipping Tool or blown out like Lightshot).
-
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -24,9 +17,9 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Foundation::{BOOL, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::{
@@ -82,20 +75,18 @@ impl Default for DisplayHdrInfo {
     }
 }
 
-/// Top-down 32-bit BGRA captured image of one monitor, with virtual desktop coordinates.
 #[derive(Clone)]
 pub struct CapturedScreen {
     pub width: u32,
     pub height: u32,
     pub monitor_rect: RECT,
-    /// Top-down BGRA8 pixels (`width * height * 4` bytes).
+
     pub bgra: Vec<u8>,
     pub hdr_info: DisplayHdrInfo,
     pub capture_ms: f64,
 }
 
 impl CapturedScreen {
-    /// Extracts a cropped RGBA8 buffer for PNG encoding.
     pub fn crop_rgba(&self, rect: RECT) -> (u32, u32, Vec<u8>) {
         let x0 = rect.left.clamp(0, self.width as i32) as u32;
         let y0 = rect.top.clamp(0, self.height as i32) as u32;
@@ -109,16 +100,15 @@ impl CapturedScreen {
             let row_start = (y as usize) * stride + (x0 as usize) * 4;
             let row = &self.bgra[row_start..row_start + (cw as usize) * 4];
             for px in row.chunks_exact(4) {
-                rgba.push(px[2]); // R
-                rgba.push(px[1]); // G
-                rgba.push(px[0]); // B
-                rgba.push(255); // A
+                rgba.push(px[2]);
+                rgba.push(px[1]);
+                rgba.push(px[0]);
+                rgba.push(255);
             }
         }
         (cw, ch, rgba)
     }
 
-    /// Extracts a cropped top-down BGRA8 buffer.
     pub fn crop_bgra(&self, rect: RECT) -> (u32, u32, Vec<u8>) {
         let x0 = rect.left.clamp(0, self.width as i32) as u32;
         let y0 = rect.top.clamp(0, self.height as i32) as u32;
@@ -161,7 +151,6 @@ fn monitor_info_for_handle(hmon: HMONITOR) -> (RECT, String) {
     )
 }
 
-/// Returns `(HMONITOR, monitor_rect, gdi_device_name)` for the monitor currently under the cursor.
 pub fn target_monitor_under_cursor() -> (HMONITOR, RECT, String) {
     unsafe {
         let mut pt = POINT::default();
@@ -172,14 +161,8 @@ pub fn target_monitor_under_cursor() -> (HMONITOR, RECT, String) {
             return (hmon, rect, name);
         }
 
-        // Fallback via EnumDisplayMonitors (e.g. non-interactive desktop)
         let mut first: Option<HMONITOR> = None;
-        unsafe extern "system" fn cb(
-            hm: HMONITOR,
-            _: HDC,
-            _: *mut RECT,
-            data: LPARAM,
-        ) -> BOOL {
+        unsafe extern "system" fn cb(hm: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
             let slot = &mut *(data.0 as *mut Option<HMONITOR>);
             if slot.is_none() {
                 *slot = Some(hm);
@@ -293,13 +276,11 @@ pub fn query_display_hdr_info(target_device: &str) -> DisplayHdrInfo {
     }
 }
 
-/// Captures the monitor currently under the cursor into an accurate sRGB BGRA8 image.
 pub fn capture_active_monitor() -> Result<CapturedScreen> {
     let t0 = Instant::now();
     let (hmon, mon_rect, dev_name) = target_monitor_under_cursor();
     let hdr_info = query_display_hdr_info(&dev_name);
 
-    // Ensure WinRT initialized on this thread (ignore RPC_E_CHANGED_MODE if STA already set)
     unsafe {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
     }

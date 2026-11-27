@@ -2,7 +2,9 @@
 name = "hdr-snip"
 version = "0.2.0"
 edition = "2021"
-description = "Lightweight Windows 11 native HDR->sRGB screenshot tool (Lightshot-style crop bar, PrintScreen + Win+Shift+S, all-users ready)."
+license = "MIT"
+repository = "https://github.com/Junior774/hdr-snip"
+description = "Tiny native Rust Windows HDR->sRGB screenshot tool with exact #FFFFFF whites, Keycap Minimal overlay, and PrintScreen / Win+Shift+S support."
 
 [dependencies]
 half = "2.4"
