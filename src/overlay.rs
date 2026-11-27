@@ -1,43 +1,80 @@
-//! Lightshot-style fullscreen crop overlay with floating action toolbar.
+//! Keycap Minimal fullscreen crop overlay with native anti-aliased SDF rendering.
 //!
 //! Features:
-//! - Instant double-buffered GDI rendering (bright original + dimmed backdrop, zero flicker)
-//! - Drag to select region, drag inside to move, drag 8 corner/edge handles to resize
-//! - Dimensions badge (`W × H`) above selection
-//! - Floating toolbar on release: Copiar (`Ctrl+C`/`Enter`), Salvar (`Ctrl+S`), Tela Toda (`F`), Cancelar (`Esc`)
-//! - Double-click inside selection copies immediately
+//! - Cached 32-bit DIB double-buffer (zero allocation on drag, zero flicker)
+//! - Pure-Rust analytical SDF anti-aliasing for rounded capsules, soft drop shadows,
+//!   double-contrast borders, L-bracket corner handles, and Lucide-style vector icons
+//! - Per-Monitor DPI scaling (stays crisp at 100%, 125%, 150%, 200% on any resolution)
+//! - Floating Keycap Minimal toolbar: Copiar [↵] · Salvar [S] · Tela [F] | ✕ [Esc]
+//! - Direct shortcuts (`Enter`/`C`/`Ctrl+C`, `S`/`Ctrl+S`, `F`, `Esc`) + double-click to copy
 
 use std::cell::RefCell;
+use std::path::Path;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection,
-    CreateFontW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint,
-    FillRect, InvalidateRect, Rectangle, RoundRect, SelectObject, SetBkMode, SetTextColor,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DEFAULT_QUALITY, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_SWISS, FW_SEMIBOLD,
-    HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, HPEN, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    PS_SOLID, SRCCOPY, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject,
+    DrawTextW, EndPaint, GdiFlush, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint,
+    SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
+    DT_SINGLELINE, DT_VCENTER, FF_MODERN, FF_SWISS, FIXED_PITCH, FW_MEDIUM, FW_SEMIBOLD, HBITMAP,
+    HDC, HFONT, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, SetFocus, VK_C, VK_CONTROL, VK_ESCAPE, VK_F,
-    VK_RETURN, VK_S,
+    ReleaseCapture, SetCapture, SetFocus, VK_C, VK_ESCAPE, VK_F, VK_RETURN, VK_S,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, RegisterClassW,
-    SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_DBLCLKS,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND,
-    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, SWP_SHOWWINDOW, SW_SHOW,
+    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
+    GetWindowLongPtrW, LoadCursorW, RegisterClassW, SetCursor, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL,
+    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
     WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW};
 
 use crate::capture::CapturedScreen;
 use crate::clipboard::{copy_crop_to_clipboard, prompt_save_png_dialog, save_crop_png};
+use crate::ui_draw::{Canvas, Rgba};
+
+// Keycap Minimal palette
+const COL_SURFACE: Rgba = Rgba::new(17, 19, 23, 244); // #111317 @ 96%
+const COL_SURFACE_BORDER: Rgba = Rgba::new(255, 255, 255, 52); // white/20%
+const COL_OUTER_HALO: Rgba = Rgba::new(0, 0, 0, 145);
+const COL_DIVIDER: Rgba = Rgba::new(255, 255, 255, 42);
+
+const COL_PRIMARY: Rgba = Rgba::rgb(5, 150, 105); // #059669 emerald-600
+const COL_PRIMARY_HOVER: Rgba = Rgba::rgb(16, 185, 129); // #10B981 emerald-500
+const COL_PRIMARY_RIM: Rgba = Rgba::new(255, 255, 255, 46);
+const COL_PRIMARY_KBD_BG: Rgba = Rgba::new(0, 0, 0, 68);
+const COL_PRIMARY_KBD_BD: Rgba = Rgba::new(255, 255, 255, 72);
+
+const COL_SEC_HOVER_BG: Rgba = Rgba::new(255, 255, 255, 32);
+const COL_SEC_HOVER_BD: Rgba = Rgba::new(255, 255, 255, 26);
+const COL_SEC_KBD_BG: Rgba = Rgba::new(255, 255, 255, 26);
+const COL_SEC_KBD_BD: Rgba = Rgba::new(255, 255, 255, 40);
+
+const COL_CANCEL_HOVER_BG: Rgba = Rgba::new(244, 63, 94, 58);
+const COL_CANCEL_HOVER_BD: Rgba = Rgba::new(251, 113, 133, 96);
+const COL_CANCEL_KBD_HOVER_BG: Rgba = Rgba::new(244, 63, 94, 46);
+const COL_CANCEL_KBD_HOVER_BD: Rgba = Rgba::new(253, 164, 175, 96);
+
+const COL_ICON_WHITE: Rgba = Rgba::rgb(255, 255, 255);
+const COL_ICON_SEC: Rgba = Rgba::rgb(236, 239, 244);
+const COL_ICON_MUTED: Rgba = Rgba::rgb(203, 213, 225);
+const COL_ICON_ROSE: Rgba = Rgba::rgb(253, 164, 175);
+
+const COL_FRAME_LIGHT: Rgba = Rgba::new(229, 231, 235, 245); // #E5E7EB
+const COL_FRAME_DARK: Rgba = Rgba::new(0, 0, 0, 170);
+const COL_HDR_DOT: Rgba = Rgba::rgb(16, 185, 129); // #10B981
+
+const fn colorref(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragMode {
@@ -62,28 +99,45 @@ enum ToolbarBtn {
     Cancel,
 }
 
-struct ButtonRect {
+struct ButtonLayout {
     kind: ToolbarBtn,
     rect: RECT,
     label: &'static str,
+    keycap: &'static str,
+    icon_cx: f32,
+    text_x: i32,
+    keycap_rect: RECT,
 }
 
 struct OverlayState {
     screen: CapturedScreen,
+    scale: f32,
     bmp_bright: HBITMAP,
     bmp_dim: HBITMAP,
-    font_ui: HFONT,
+    bmp_back: HBITMAP,
+    back_bits: *mut u8,
+    font_ui_bold: HFONT,
+    font_ui_med: HFONT,
+    font_mono: HFONT,
+    font_keycap: HFONT,
     has_selection: bool,
     sel: RECT,
     drag_mode: DragMode,
     anchor: POINT,
     orig_sel: RECT,
     hover_btn: Option<ToolbarBtn>,
-    buttons: Vec<ButtonRect>,
+    bar_rect: RECT,
+    divider_x: i32,
+    buttons: Vec<ButtonLayout>,
     on_close_cb: Option<Box<dyn FnOnce()>>,
 }
 
 impl OverlayState {
+    #[inline]
+    fn px(&self, logical: f32) -> i32 {
+        (logical * self.scale).round() as i32
+    }
+
     fn normalized_sel(&self) -> RECT {
         RECT {
             left: self.sel.left.min(self.sel.right).clamp(0, self.screen.width as i32),
@@ -106,7 +160,7 @@ impl OverlayState {
             return DragMode::None;
         }
         let r = self.normalized_sel();
-        let pad = 8;
+        let pad = self.px(9.0).max(8);
         let near_l = (x - r.left).abs() <= pad;
         let near_r = (x - r.right).abs() <= pad;
         let near_t = (y - r.top).abs() <= pad;
@@ -146,46 +200,160 @@ impl OverlayState {
         let sw = self.screen.width as i32;
         let sh = self.screen.height as i32;
 
-        let specs = [
-            (ToolbarBtn::Copy, "Copiar (Ctrl+C)", 126),
-            (ToolbarBtn::Save, "Salvar (Ctrl+S)", 122),
-            (ToolbarBtn::Full, "Tela toda (F)", 104),
-            (ToolbarBtn::Cancel, "Cancelar (Esc)", 110),
-        ];
-        let gap = 6;
-        let pad_x = 8;
-        let pad_y = 6;
-        let btn_h = 30;
-        let total_w: i32 = specs.iter().map(|s| s.2).sum::<i32>()
-            + gap * (specs.len() as i32 - 1)
-            + pad_x * 2;
-        let bar_h = btn_h + pad_y * 2;
+        // Measure labels with the exact GDI fonts for crisp, zero-clipping alignment
+        let tmp_dc = unsafe { CreateCompatibleDC(HDC::default()) };
+        let w_copy = measure_text_w(tmp_dc, self.font_ui_bold, "Copiar");
+        let w_save = measure_text_w(tmp_dc, self.font_ui_med, "Salvar");
+        let w_full = measure_text_w(tmp_dc, self.font_ui_med, "Tela");
+        let w_kbd_s = measure_text_w(tmp_dc, self.font_keycap, "S");
+        let w_kbd_f = measure_text_w(tmp_dc, self.font_keycap, "F");
+        let w_kbd_esc = measure_text_w(tmp_dc, self.font_keycap, "Esc");
+        unsafe {
+            let _ = DeleteDC(tmp_dc);
+        }
 
-        // Place right below selection, or above if near bottom edge, or inside if full screen
+        let pad_outer = self.px(5.0);
+        let btn_h = self.px(34.0);
+        let gap = self.px(4.0);
+        let div_slot = self.px(11.0);
+        let icon_w = self.px(14.0);
+        let kbd_h = self.px(19.0);
+        let kbd_pad_x = self.px(6.0);
+
+        struct Spec {
+            kind: ToolbarBtn,
+            label: &'static str,
+            keycap: &'static str,
+            label_w: i32,
+            kbd_w: i32,
+            pad_l: i32,
+            pad_r: i32,
+            gap_icon_lbl: i32,
+            gap_lbl_kbd: i32,
+        }
+
+        let specs = [
+            Spec {
+                kind: ToolbarBtn::Copy,
+                label: "Copiar",
+                keycap: "", // vector return arrow
+                label_w: w_copy,
+                kbd_w: self.px(21.0),
+                pad_l: self.px(11.0),
+                pad_r: self.px(9.0),
+                gap_icon_lbl: self.px(7.0),
+                gap_lbl_kbd: self.px(8.0),
+            },
+            Spec {
+                kind: ToolbarBtn::Save,
+                label: "Salvar",
+                keycap: "S",
+                label_w: w_save,
+                kbd_w: (w_kbd_s + kbd_pad_x * 2).max(self.px(19.0)),
+                pad_l: self.px(10.0),
+                pad_r: self.px(9.0),
+                gap_icon_lbl: self.px(6.0),
+                gap_lbl_kbd: self.px(7.0),
+            },
+            Spec {
+                kind: ToolbarBtn::Full,
+                label: "Tela",
+                keycap: "F",
+                label_w: w_full,
+                kbd_w: (w_kbd_f + kbd_pad_x * 2).max(self.px(19.0)),
+                pad_l: self.px(10.0),
+                pad_r: self.px(9.0),
+                gap_icon_lbl: self.px(6.0),
+                gap_lbl_kbd: self.px(7.0),
+            },
+            Spec {
+                kind: ToolbarBtn::Cancel,
+                label: "",
+                keycap: "Esc",
+                label_w: 0,
+                kbd_w: (w_kbd_esc + kbd_pad_x * 2).max(self.px(28.0)),
+                pad_l: self.px(9.0),
+                pad_r: self.px(9.0),
+                gap_icon_lbl: 0,
+                gap_lbl_kbd: self.px(6.0),
+            },
+        ];
+
+        let btn_widths: Vec<i32> = specs
+            .iter()
+            .map(|sp| {
+                sp.pad_l
+                    + icon_w
+                    + if sp.label_w > 0 {
+                        sp.gap_icon_lbl + sp.label_w
+                    } else {
+                        0
+                    }
+                    + sp.gap_lbl_kbd
+                    + sp.kbd_w
+                    + sp.pad_r
+            })
+            .collect();
+
+        // Copy + gap + Save + gap + Full + div_slot + Cancel
+        let inner_w = btn_widths[0] + gap + btn_widths[1] + gap + btn_widths[2] + div_slot + btn_widths[3];
+        let total_w = inner_w + pad_outer * 2;
+        let bar_h = btn_h + pad_outer * 2;
+        let margin = self.px(10.0);
+
         let mut bar_x = (r.right - total_w).max(r.left);
-        bar_x = bar_x.clamp(10, (sw - total_w - 10).max(10));
-        let bar_y = if r.bottom + 8 + bar_h <= sh - 8 {
-            r.bottom + 8
-        } else if r.top - 8 - bar_h >= 8 {
-            r.top - 8 - bar_h
+        bar_x = bar_x.clamp(margin, (sw - total_w - margin).max(margin));
+        let bar_y = if r.bottom + margin + bar_h <= sh - margin {
+            r.bottom + margin
+        } else if r.top - margin - bar_h >= margin {
+            r.top - margin - bar_h
         } else {
-            (r.bottom - bar_h - 12).max(12)
+            (r.bottom - bar_h - self.px(14.0)).max(margin)
         };
 
-        let mut cx = bar_x + pad_x;
-        let cy = bar_y + pad_y;
-        for (kind, label, w) in specs {
-            self.buttons.push(ButtonRect {
-                kind,
+        self.bar_rect = RECT {
+            left: bar_x,
+            top: bar_y,
+            right: bar_x + total_w,
+            bottom: bar_y + bar_h,
+        };
+
+        let mut cx = bar_x + pad_outer;
+        let cy = bar_y + pad_outer;
+        let kbd_y = cy + (btn_h - kbd_h) / 2;
+
+        for (idx, sp) in specs.iter().enumerate() {
+            let bw = btn_widths[idx];
+            let icon_cx = (cx + sp.pad_l) as f32 + icon_w as f32 * 0.5;
+            let text_x = cx + sp.pad_l + icon_w + sp.gap_icon_lbl;
+            let kbd_x = cx + bw - sp.pad_r - sp.kbd_w;
+
+            self.buttons.push(ButtonLayout {
+                kind: sp.kind,
                 rect: RECT {
                     left: cx,
                     top: cy,
-                    right: cx + w,
+                    right: cx + bw,
                     bottom: cy + btn_h,
                 },
-                label,
+                label: sp.label,
+                keycap: sp.keycap,
+                icon_cx,
+                text_x,
+                keycap_rect: RECT {
+                    left: kbd_x,
+                    top: kbd_y,
+                    right: kbd_x + sp.kbd_w,
+                    bottom: kbd_y + kbd_h,
+                },
             });
-            cx += w + gap;
+
+            if idx == 2 {
+                self.divider_x = cx + bw + div_slot / 2;
+                cx += bw + div_slot;
+            } else {
+                cx += bw + gap;
+            }
         }
     }
 
@@ -197,19 +365,499 @@ impl OverlayState {
         }
         None
     }
+
+    /// Renders the complete overlay frame into `self.bmp_back` using `mem_dc`.
+    fn render_frame(&self, mem_dc: HDC, src_dc: HDC) {
+        let w = self.screen.width as i32;
+        let h = self.screen.height as i32;
+        let s = self.scale;
+
+        unsafe {
+            // 1) Dimmed full screen backdrop
+            let old_src = SelectObject(src_dc, self.bmp_dim);
+            let _ = BitBlt(mem_dc, 0, 0, w, h, src_dc, 0, 0, SRCCOPY);
+
+            // 2) Bright cropped region
+            if self.sel_valid() {
+                let r = self.normalized_sel();
+                SelectObject(src_dc, self.bmp_bright);
+                let _ = BitBlt(
+                    mem_dc,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    src_dc,
+                    r.left,
+                    r.top,
+                    SRCCOPY,
+                );
+            }
+            SelectObject(src_dc, old_src);
+            let _ = GdiFlush();
+        }
+
+        // 3) Pure-Rust anti-aliased SDF rendering pass on the 32-bit DIB backbuffer
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(self.back_bits, (w as usize) * (h as usize) * 4)
+        };
+        let mut canvas = Canvas::new(slice, w, h);
+
+        // Precompute top-hint layout or dimension-pill layout so text pass uses exact rects
+        let mut dim_pill_info: Option<(RECT, String, bool)> = None;
+        let mut hint_info: Option<HintLayout> = None;
+
+        if self.sel_valid() {
+            let r = self.normalized_sel();
+            let rw = r.right - r.left;
+            let rh = r.bottom - r.top;
+
+            // Selection border: outer dark contrast halo + crisp bright #E5E7EB inner frame
+            canvas.fill_rect_i32(r.left - 1, r.top - 1, rw + 2, 1, COL_FRAME_DARK);
+            canvas.fill_rect_i32(r.left - 1, r.bottom, rw + 2, 1, COL_FRAME_DARK);
+            canvas.fill_rect_i32(r.left - 1, r.top, 1, rh, COL_FRAME_DARK);
+            canvas.fill_rect_i32(r.right, r.top, 1, rh, COL_FRAME_DARK);
+
+            let bt = self.px(1.5).max(1);
+            canvas.fill_rect_i32(r.left, r.top, rw, bt, COL_FRAME_LIGHT);
+            canvas.fill_rect_i32(r.left, r.bottom - bt, rw, bt, COL_FRAME_LIGHT);
+            canvas.fill_rect_i32(r.left, r.top, bt, rh, COL_FRAME_LIGHT);
+            canvas.fill_rect_i32(r.right - bt, r.top, bt, rh, COL_FRAME_LIGHT);
+
+            // Sleek white corner L-brackets with contrast shadow
+            let leg = self.px(13.0).min(rw / 3).min(rh / 3).max(self.px(5.0));
+            let thick = self.px(2.5).max(2);
+            let out = self.px(1.0).max(1);
+            canvas.draw_corner_bracket(r.left - out, r.top - out, 1, 1, leg, thick);
+            canvas.draw_corner_bracket(r.right + out - thick, r.top - out, -1, 1, leg, thick);
+            canvas.draw_corner_bracket(r.left - out, r.bottom + out - thick, 1, -1, leg, thick);
+            canvas.draw_corner_bracket(
+                r.right + out - thick,
+                r.bottom + out - thick,
+                -1,
+                -1,
+                leg,
+                thick,
+            );
+
+            // Subtle midpoint edge bars when selection is large enough
+            let mid_len = self.px(12.0);
+            let mid_t = self.px(2.4).max(2);
+            if rw >= self.px(76.0) {
+                let mx = (r.left + r.right - mid_len) / 2;
+                canvas.fill_rect_i32(mx - 1, r.top - out - 1, mid_len + 2, mid_t + 2, COL_FRAME_DARK);
+                canvas.fill_rect_i32(mx, r.top - out, mid_len, mid_t, COL_ICON_WHITE);
+                canvas.fill_rect_i32(
+                    mx - 1,
+                    r.bottom + out - mid_t - 1,
+                    mid_len + 2,
+                    mid_t + 2,
+                    COL_FRAME_DARK,
+                );
+                canvas.fill_rect_i32(mx, r.bottom + out - mid_t, mid_len, mid_t, COL_ICON_WHITE);
+            }
+            if rh >= self.px(76.0) {
+                let my = (r.top + r.bottom - mid_len) / 2;
+                canvas.fill_rect_i32(r.left - out - 1, my - 1, mid_t + 2, mid_len + 2, COL_FRAME_DARK);
+                canvas.fill_rect_i32(r.left - out, my, mid_t, mid_len, COL_ICON_WHITE);
+                canvas.fill_rect_i32(
+                    r.right + out - mid_t - 1,
+                    my - 1,
+                    mid_t + 2,
+                    mid_len + 2,
+                    COL_FRAME_DARK,
+                );
+                canvas.fill_rect_i32(r.right + out - mid_t, my, mid_t, mid_len, COL_ICON_WHITE);
+            }
+
+            // Dimensions pill (auto-sized to text)
+            let dim_str = format!("{} × {}", rw, rh);
+            let hdr = self.screen.hdr_info.hdr_enabled;
+            let dim_w = measure_text_w(mem_dc, self.font_mono, &dim_str);
+            let hdr_w = if hdr {
+                measure_text_w(mem_dc, self.font_ui_med, "HDR→sRGB")
+            } else {
+                0
+            };
+            let pad_x = self.px(10.0);
+            let dot_slot = if hdr { self.px(16.0) } else { 0 };
+            let pill_w = pad_x * 2 + dim_w + dot_slot + hdr_w;
+            let pill_h = self.px(25.0);
+            let margin = self.px(8.0);
+            let px = r.left.clamp(margin, (w - pill_w - margin).max(margin));
+            let py = if r.top >= pill_h + margin + self.px(2.0) {
+                r.top - pill_h - margin
+            } else {
+                r.top + margin
+            };
+            let pr = RECT {
+                left: px,
+                top: py,
+                right: px + pill_w,
+                bottom: py + pill_h,
+            };
+
+            let pr_rad = 8.0 * s;
+            canvas.draw_soft_shadow(
+                pr.left as f32,
+                pr.top as f32,
+                pill_w as f32,
+                pill_h as f32,
+                pr_rad,
+                3.0 * s,
+                9.0 * s,
+                0.42,
+            );
+            canvas.stroke_round_rect(
+                pr.left as f32 - 1.0,
+                pr.top as f32 - 1.0,
+                pill_w as f32 + 2.0,
+                pill_h as f32 + 2.0,
+                pr_rad + 1.0,
+                1.0,
+                COL_OUTER_HALO,
+            );
+            canvas.fill_round_rect(
+                pr.left as f32,
+                pr.top as f32,
+                pill_w as f32,
+                pill_h as f32,
+                pr_rad,
+                COL_SURFACE,
+            );
+            canvas.stroke_round_rect(
+                pr.left as f32,
+                pr.top as f32,
+                pill_w as f32,
+                pill_h as f32,
+                pr_rad,
+                1.0,
+                COL_SURFACE_BORDER,
+            );
+
+            if hdr {
+                let dot_cx = (pr.left + pad_x + dim_w + self.px(8.0)) as f32;
+                let dot_cy = pr.top as f32 + pill_h as f32 * 0.5;
+                canvas.fill_circle(dot_cx, dot_cy, 2.8 * s, COL_HDR_DOT);
+            }
+            dim_pill_info = Some((pr, dim_str, hdr));
+        } else {
+            // Matching Keycap Minimal top hint pill before first drag
+            let hl = compute_hint_layout(self, mem_dc, w);
+            let hr = hl.bar;
+            let hw = (hr.right - hr.left) as f32;
+            let hh = (hr.bottom - hr.top) as f32;
+            let rad = 11.0 * s;
+
+            canvas.draw_soft_shadow(hr.left as f32, hr.top as f32, hw, hh, rad, 5.0 * s, 14.0 * s, 0.45);
+            canvas.stroke_round_rect(
+                hr.left as f32 - 1.0,
+                hr.top as f32 - 1.0,
+                hw + 2.0,
+                hh + 2.0,
+                rad + 1.0,
+                1.0,
+                COL_OUTER_HALO,
+            );
+            canvas.fill_round_rect(hr.left as f32, hr.top as f32, hw, hh, rad, COL_SURFACE);
+            canvas.stroke_round_rect(hr.left as f32, hr.top as f32, hw, hh, rad, 1.0, COL_SURFACE_BORDER);
+
+            // Keycap badges for [F] and [Esc] + subtle vertical dividers
+            let div_h = self.px(14.0);
+            let div_y = hr.top + (hr.bottom - hr.top - div_h) / 2;
+            canvas.fill_rect_i32(hl.div1_x, div_y, 1, div_h, COL_DIVIDER);
+            canvas.fill_rect_i32(hl.div2_x, div_y, 1, div_h, COL_DIVIDER);
+
+            for kr in [hl.kbd_f, hl.kbd_esc] {
+                let kw = (kr.right - kr.left) as f32;
+                let kh = (kr.bottom - kr.top) as f32;
+                canvas.fill_round_rect(kr.left as f32, kr.top as f32, kw, kh, 4.5 * s, COL_SEC_KBD_BG);
+                canvas.stroke_round_rect(kr.left as f32, kr.top as f32, kw, kh, 4.5 * s, 1.0, COL_SEC_KBD_BD);
+            }
+            hint_info = Some(hl);
+        }
+
+        // 4) Keycap Minimal Floating Toolbar (AA capsule, buttons, icons, keycaps)
+        if !self.buttons.is_empty() {
+            let br = self.bar_rect;
+            let bw = (br.right - br.left) as f32;
+            let bh = (br.bottom - br.top) as f32;
+            let bar_rad = 12.0 * s;
+
+            // Elevation shadow + outer dark contrast ring + dark glass capsule + crisp inner 1px border
+            canvas.draw_soft_shadow(br.left as f32, br.top as f32, bw, bh, bar_rad, 6.0 * s, 15.0 * s, 0.50);
+            canvas.stroke_round_rect(
+                br.left as f32 - 1.0,
+                br.top as f32 - 1.0,
+                bw + 2.0,
+                bh + 2.0,
+                bar_rad + 1.0,
+                1.0,
+                COL_OUTER_HALO,
+            );
+            canvas.fill_round_rect(br.left as f32, br.top as f32, bw, bh, bar_rad, COL_SURFACE);
+            canvas.stroke_round_rect(
+                br.left as f32,
+                br.top as f32,
+                bw,
+                bh,
+                bar_rad,
+                1.0,
+                COL_SURFACE_BORDER,
+            );
+
+            // Hairline divider before Cancel
+            let div_h = self.px(18.0);
+            let div_y = br.top + (br.bottom - br.top - div_h) / 2;
+            canvas.fill_rect_i32(self.divider_x, div_y, 1, div_h, COL_DIVIDER);
+
+            let btn_rad = 8.0 * s;
+            let kbd_rad = 4.5 * s;
+
+            for b in &self.buttons {
+                let hovered = self.hover_btn == Some(b.kind);
+                let rx = b.rect.left as f32;
+                let ry = b.rect.top as f32;
+                let rw = (b.rect.right - b.rect.left) as f32;
+                let rh = (b.rect.bottom - b.rect.top) as f32;
+
+                // Button surface
+                match (b.kind, hovered) {
+                    (ToolbarBtn::Copy, true) => {
+                        canvas.fill_round_rect(rx, ry, rw, rh, btn_rad, COL_PRIMARY_HOVER);
+                        canvas.stroke_round_rect(rx, ry, rw, rh, btn_rad, 1.0, COL_PRIMARY_RIM);
+                    }
+                    (ToolbarBtn::Copy, false) => {
+                        canvas.fill_round_rect(rx, ry, rw, rh, btn_rad, COL_PRIMARY);
+                        canvas.stroke_round_rect(rx, ry, rw, rh, btn_rad, 1.0, COL_PRIMARY_RIM);
+                    }
+                    (ToolbarBtn::Cancel, true) => {
+                        canvas.fill_round_rect(rx, ry, rw, rh, btn_rad, COL_CANCEL_HOVER_BG);
+                        canvas.stroke_round_rect(rx, ry, rw, rh, btn_rad, 1.0, COL_CANCEL_HOVER_BD);
+                    }
+                    (_, true) => {
+                        canvas.fill_round_rect(rx, ry, rw, rh, btn_rad, COL_SEC_HOVER_BG);
+                        canvas.stroke_round_rect(rx, ry, rw, rh, btn_rad, 1.0, COL_SEC_HOVER_BD);
+                    }
+                    _ => {}
+                }
+
+                // Vector icon
+                let icon_cy = ry + rh * 0.5;
+                match b.kind {
+                    ToolbarBtn::Copy => canvas.draw_icon_copy(b.icon_cx, icon_cy, s, COL_ICON_WHITE),
+                    ToolbarBtn::Save => canvas.draw_icon_save(b.icon_cx, icon_cy, s, COL_ICON_SEC),
+                    ToolbarBtn::Full => {
+                        canvas.draw_icon_fullscreen(b.icon_cx, icon_cy, s, COL_ICON_SEC)
+                    }
+                    ToolbarBtn::Cancel => {
+                        let col = if hovered { COL_ICON_ROSE } else { COL_ICON_MUTED };
+                        canvas.draw_icon_close(b.icon_cx, icon_cy, s, col);
+                    }
+                }
+
+                // Keycap pill
+                let kr = b.keycap_rect;
+                let kw = (kr.right - kr.left) as f32;
+                let kh = (kr.bottom - kr.top) as f32;
+                let (kbg, kbd) = match (b.kind, hovered) {
+                    (ToolbarBtn::Copy, _) => (COL_PRIMARY_KBD_BG, COL_PRIMARY_KBD_BD),
+                    (ToolbarBtn::Cancel, true) => (COL_CANCEL_KBD_HOVER_BG, COL_CANCEL_KBD_HOVER_BD),
+                    _ => (COL_SEC_KBD_BG, COL_SEC_KBD_BD),
+                };
+                canvas.fill_round_rect(kr.left as f32, kr.top as f32, kw, kh, kbd_rad, kbg);
+                canvas.stroke_round_rect(kr.left as f32, kr.top as f32, kw, kh, kbd_rad, 1.0, kbd);
+
+                if b.kind == ToolbarBtn::Copy {
+                    canvas.draw_icon_return(
+                        kr.left as f32 + kw * 0.5,
+                        kr.top as f32 + kh * 0.5,
+                        s,
+                        COL_ICON_WHITE,
+                    );
+                }
+            }
+        }
+
+        // 5) Crisp ClearType text pass via GDI
+        unsafe {
+            SetBkMode(mem_dc, TRANSPARENT);
+
+            if let Some((pr, dim_str, hdr)) = dim_pill_info {
+                let pad_x = self.px(10.0);
+                let old_f = SelectObject(mem_dc, self.font_mono);
+                SetTextColor(mem_dc, colorref(248, 250, 252));
+                let mut tr = RECT {
+                    left: pr.left + pad_x,
+                    top: pr.top,
+                    right: pr.right,
+                    bottom: pr.bottom,
+                };
+                draw_str(mem_dc, &dim_str, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                if hdr {
+                    let dim_w = measure_text_w(mem_dc, self.font_mono, &dim_str);
+                    SelectObject(mem_dc, self.font_ui_med);
+                    SetTextColor(mem_dc, colorref(186, 200, 218));
+                    let mut hr_t = RECT {
+                        left: pr.left + pad_x + dim_w + self.px(16.0),
+                        top: pr.top,
+                        right: pr.right,
+                        bottom: pr.bottom,
+                    };
+                    draw_str(mem_dc, "HDR→sRGB", &mut hr_t, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                }
+                SelectObject(mem_dc, old_f);
+            } else if let Some(hl) = hint_info {
+                let old_f = SelectObject(mem_dc, self.font_ui_med);
+                SetTextColor(mem_dc, colorref(244, 246, 250));
+                let mut r1 = hl.txt_drag;
+                draw_str(mem_dc, "Arraste para recortar", &mut r1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                SetTextColor(mem_dc, colorref(203, 213, 225));
+                let mut r2 = hl.txt_full;
+                draw_str(mem_dc, "Tela toda", &mut r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                let mut r3 = hl.txt_esc;
+                draw_str(mem_dc, "Sair", &mut r3, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                SelectObject(mem_dc, self.font_keycap);
+                SetTextColor(mem_dc, colorref(226, 232, 240));
+                let mut kf = hl.kbd_f;
+                draw_str(mem_dc, "F", &mut kf, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                let mut ke = hl.kbd_esc;
+                draw_str(mem_dc, "Esc", &mut ke, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(mem_dc, old_f);
+            }
+
+            if !self.buttons.is_empty() {
+                let old_f = SelectObject(mem_dc, self.font_ui_med);
+                for b in &self.buttons {
+                    let hovered = self.hover_btn == Some(b.kind);
+                    if !b.label.is_empty() {
+                        if b.kind == ToolbarBtn::Copy {
+                            SelectObject(mem_dc, self.font_ui_bold);
+                            SetTextColor(mem_dc, colorref(255, 255, 255));
+                        } else {
+                            SelectObject(mem_dc, self.font_ui_med);
+                            SetTextColor(mem_dc, colorref(236, 239, 244));
+                        }
+                        let mut tr = RECT {
+                            left: b.text_x,
+                            top: b.rect.top,
+                            right: b.keycap_rect.left,
+                            bottom: b.rect.bottom,
+                        };
+                        draw_str(mem_dc, b.label, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    }
+                    if !b.keycap.is_empty() {
+                        SelectObject(mem_dc, self.font_keycap);
+                        let col = if b.kind == ToolbarBtn::Cancel && hovered {
+                            colorref(254, 205, 211)
+                        } else {
+                            colorref(203, 213, 225)
+                        };
+                        SetTextColor(mem_dc, col);
+                        let mut kr = b.keycap_rect;
+                        draw_str(mem_dc, b.keycap, &mut kr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    }
+                }
+                SelectObject(mem_dc, old_f);
+            }
+            let _ = GdiFlush();
+        }
+    }
+}
+
+struct HintLayout {
+    bar: RECT,
+    txt_drag: RECT,
+    div1_x: i32,
+    txt_full: RECT,
+    kbd_f: RECT,
+    div2_x: i32,
+    txt_esc: RECT,
+    kbd_esc: RECT,
+}
+
+fn compute_hint_layout(st: &OverlayState, dc: HDC, screen_w: i32) -> HintLayout {
+    let w_drag = measure_text_w(dc, st.font_ui_med, "Arraste para recortar");
+    let w_full = measure_text_w(dc, st.font_ui_med, "Tela toda");
+    let w_esc = measure_text_w(dc, st.font_ui_med, "Sair");
+    let w_kf = (measure_text_w(dc, st.font_keycap, "F") + st.px(12.0)).max(st.px(19.0));
+    let w_ke = (measure_text_w(dc, st.font_keycap, "Esc") + st.px(12.0)).max(st.px(28.0));
+
+    let pad_x = st.px(14.0);
+    let div_gap = st.px(11.0);
+    let kbd_gap = st.px(6.0);
+    let bar_h = st.px(36.0);
+    let kbd_h = st.px(19.0);
+
+    let total_w = pad_x * 2
+        + w_drag
+        + div_gap * 2
+        + 1
+        + w_full
+        + kbd_gap
+        + w_kf
+        + div_gap * 2
+        + 1
+        + w_esc
+        + kbd_gap
+        + w_ke;
+
+    let bx = (screen_w - total_w) / 2;
+    let by = st.px(22.0);
+    let bar = RECT {
+        left: bx,
+        top: by,
+        right: bx + total_w,
+        bottom: by + bar_h,
+    };
+    let ky = by + (bar_h - kbd_h) / 2;
+
+    let mut cx = bx + pad_x;
+    let txt_drag = RECT { left: cx, top: by, right: cx + w_drag, bottom: by + bar_h };
+    cx += w_drag + div_gap;
+    let div1_x = cx;
+    cx += 1 + div_gap;
+    let txt_full = RECT { left: cx, top: by, right: cx + w_full, bottom: by + bar_h };
+    cx += w_full + kbd_gap;
+    let kbd_f = RECT { left: cx, top: ky, right: cx + w_kf, bottom: ky + kbd_h };
+    cx += w_kf + div_gap;
+    let div2_x = cx;
+    cx += 1 + div_gap;
+    let txt_esc = RECT { left: cx, top: by, right: cx + w_esc, bottom: by + bar_h };
+    cx += w_esc + kbd_gap;
+    let kbd_esc = RECT { left: cx, top: ky, right: cx + w_ke, bottom: ky + kbd_h };
+
+    HintLayout {
+        bar,
+        txt_drag,
+        div1_x,
+        txt_full,
+        kbd_f,
+        div2_x,
+        txt_esc,
+        kbd_esc,
+    }
 }
 
 impl Drop for OverlayState {
     fn drop(&mut self) {
         unsafe {
-            if !self.bmp_bright.is_invalid() {
-                let _ = DeleteObject(self.bmp_bright);
+            for bmp in [self.bmp_bright, self.bmp_dim, self.bmp_back] {
+                if !bmp.is_invalid() {
+                    let _ = DeleteObject(bmp);
+                }
             }
-            if !self.bmp_dim.is_invalid() {
-                let _ = DeleteObject(self.bmp_dim);
-            }
-            if !self.font_ui.is_invalid() {
-                let _ = DeleteObject(self.font_ui);
+            for f in [
+                self.font_ui_bold,
+                self.font_ui_med,
+                self.font_mono,
+                self.font_keycap,
+            ] {
+                if !f.is_invalid() {
+                    let _ = DeleteObject(f);
+                }
             }
         }
         if let Some(cb) = self.on_close_cb.take() {
@@ -218,7 +866,7 @@ impl Drop for OverlayState {
     }
 }
 
-fn create_topdown_dib(width: u32, height: u32, bgra: &[u8]) -> HBITMAP {
+fn create_topdown_dib(width: u32, height: u32, bgra: Option<&[u8]>) -> (HBITMAP, *mut u8) {
     unsafe {
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader = BITMAPINFOHEADER {
@@ -234,22 +882,197 @@ fn create_topdown_dib(width: u32, height: u32, bgra: &[u8]) -> HBITMAP {
         let hbmp = CreateDIBSection(HDC::default(), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
             .unwrap_or_default();
         if !hbmp.is_invalid() && !bits.is_null() {
-            std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+            if let Some(src) = bgra {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), bits as *mut u8, src.len());
+            }
         }
-        hbmp
+        (hbmp, bits as *mut u8)
     }
 }
 
 fn make_dimmed_bgra(bgra: &[u8]) -> Vec<u8> {
     let mut dim = vec![0u8; bgra.len()];
     for (src, dst) in bgra.chunks_exact(4).zip(dim.chunks_exact_mut(4)) {
-        // Darken to ~45% brightness for clean Lightshot-style backdrop
-        dst[0] = ((src[0] as u16 * 115) >> 8) as u8;
-        dst[1] = ((src[1] as u16 * 115) >> 8) as u8;
-        dst[2] = ((src[2] as u16 * 115) >> 8) as u8;
+        // Darken to ~44% brightness so the bright crop & toolbar pop cleanly
+        dst[0] = ((src[0] as u16 * 112) >> 8) as u8;
+        dst[1] = ((src[1] as u16 * 112) >> 8) as u8;
+        dst[2] = ((src[2] as u16 * 112) >> 8) as u8;
         dst[3] = 255;
     }
     dim
+}
+
+fn create_ui_font(face_name: &str, px_height: i32, weight: i32, monospace: bool) -> HFONT {
+    let wide: Vec<u16> = face_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut face = [0u16; 32];
+    let n = wide.len().min(32);
+    face[..n].copy_from_slice(&wide[..n]);
+    let pitch_family = if monospace {
+        (FIXED_PITCH.0 | FF_MODERN.0) as u32
+    } else {
+        (DEFAULT_PITCH.0 | FF_SWISS.0) as u32
+    };
+    unsafe {
+        CreateFontW(
+            -px_height,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            pitch_family,
+            PCWSTR(face.as_ptr()),
+        )
+    }
+}
+
+fn measure_text_w(dc: HDC, font: HFONT, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut sz = SIZE::default();
+    unsafe {
+        let old = SelectObject(dc, font);
+        let _ = GetTextExtentPoint32W(dc, &wide, &mut sz);
+        SelectObject(dc, old);
+    }
+    sz.cx
+}
+
+unsafe fn draw_str(
+    dc: HDC,
+    text: &str,
+    rect: &mut RECT,
+    flags: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
+) {
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    DrawTextW(dc, &mut wide, rect, flags);
+}
+
+fn query_monitor_scale(mon_rect: RECT) -> f32 {
+    unsafe {
+        let pt = POINT {
+            x: mon_rect.left + (mon_rect.right - mon_rect.left) / 2,
+            y: mon_rect.top + (mon_rect.bottom - mon_rect.top) / 2,
+        };
+        let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut dpi_x: u32 = 96;
+        let mut dpi_y: u32 = 96;
+        if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() && dpi_x >= 72
+        {
+            (dpi_x as f32 / 96.0).clamp(1.0, 3.0)
+        } else {
+            1.0
+        }
+    }
+}
+
+fn build_overlay_state(screen: CapturedScreen, on_close: Option<Box<dyn FnOnce()>>) -> OverlayState {
+    let scale = query_monitor_scale(screen.monitor_rect);
+    let (bmp_bright, _) = create_topdown_dib(screen.width, screen.height, Some(&screen.bgra));
+    let dim_bgra = make_dimmed_bgra(&screen.bgra);
+    let (bmp_dim, _) = create_topdown_dib(screen.width, screen.height, Some(&dim_bgra));
+    let (bmp_back, back_bits) = create_topdown_dib(screen.width, screen.height, None);
+
+    let font_ui_bold = create_ui_font(
+        "Segoe UI",
+        (14.0 * scale).round() as i32,
+        FW_SEMIBOLD.0 as i32,
+        false,
+    );
+    let font_ui_med = create_ui_font(
+        "Segoe UI",
+        (14.0 * scale).round() as i32,
+        FW_MEDIUM.0 as i32,
+        false,
+    );
+    let font_mono = create_ui_font(
+        "Consolas",
+        (13.0 * scale).round() as i32,
+        FW_SEMIBOLD.0 as i32,
+        true,
+    );
+    let font_keycap = create_ui_font(
+        "Consolas",
+        (11.5 * scale).round() as i32,
+        FW_SEMIBOLD.0 as i32,
+        true,
+    );
+
+    OverlayState {
+        screen,
+        scale,
+        bmp_bright,
+        bmp_dim,
+        bmp_back,
+        back_bits,
+        font_ui_bold,
+        font_ui_med,
+        font_mono,
+        font_keycap,
+        has_selection: false,
+        sel: RECT::default(),
+        drag_mode: DragMode::None,
+        anchor: POINT::default(),
+        orig_sel: RECT::default(),
+        hover_btn: None,
+        bar_rect: RECT::default(),
+        divider_x: 0,
+        buttons: Vec::new(),
+        on_close_cb: on_close,
+    }
+}
+
+/// Offline UI render self-test: draws the real Keycap Minimal overlay with a sample
+/// selection onto `screen` and saves it to `out_path` for visual inspection.
+pub fn render_ui_preview_png(screen: CapturedScreen, out_path: &Path) -> Result<(), String> {
+    let w = screen.width;
+    let h = screen.height;
+    let mut st = build_overlay_state(screen, None);
+    st.has_selection = true;
+    st.sel = RECT {
+        left: (w as i32) / 5,
+        top: (h as i32) / 4,
+        right: (w as i32) * 3 / 4,
+        bottom: (h as i32) * 2 / 3,
+    };
+    st.compute_toolbar();
+
+    unsafe {
+        let mem_dc = CreateCompatibleDC(HDC::default());
+        let old_mem = SelectObject(mem_dc, st.bmp_back);
+        let src_dc = CreateCompatibleDC(HDC::default());
+        st.render_frame(mem_dc, src_dc);
+        let _ = DeleteDC(src_dc);
+        SelectObject(mem_dc, old_mem);
+        let _ = DeleteDC(mem_dc);
+    }
+
+    let bgra = unsafe {
+        std::slice::from_raw_parts(st.back_bits as *const u8, (w as usize) * (h as usize) * 4)
+    };
+    let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+    for px in bgra.chunks_exact(4) {
+        rgb.push(px[2]);
+        rgb.push(px[1]);
+        rgb.push(px[0]);
+    }
+    let file = std::fs::File::create(out_path).map_err(|e| format!("create png: {e}"))?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| format!("png header: {e}"))?;
+    writer
+        .write_image_data(&rgb)
+        .map_err(|e| format!("png write: {e}"))?;
+    Ok(())
 }
 
 thread_local! {
@@ -277,53 +1100,13 @@ fn ensure_overlay_class(hinst: HINSTANCE) {
     });
 }
 
-/// Opens the fullscreen Lightshot-style crop overlay for `screen`.
+/// Opens the fullscreen Keycap Minimal crop overlay for `screen`.
 pub fn show_overlay(screen: CapturedScreen, on_close: impl FnOnce() + 'static) {
     let hinst: HINSTANCE = unsafe { GetModuleHandleW(None).unwrap_or_default().into() };
     ensure_overlay_class(hinst);
 
-    let bmp_bright = create_topdown_dib(screen.width, screen.height, &screen.bgra);
-    let dim_bgra = make_dimmed_bgra(&screen.bgra);
-    let bmp_dim = create_topdown_dib(screen.width, screen.height, &dim_bgra);
-
-    let font_face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
-    let font_ui = unsafe {
-        let mut face = [0u16; 32];
-        let n = font_face.len().min(32);
-        face[..n].copy_from_slice(&font_face[..n]);
-        CreateFontW(
-            -13,
-            0,
-            0,
-            0,
-            FW_SEMIBOLD.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_DEFAULT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            DEFAULT_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
-            PCWSTR(face.as_ptr()),
-        )
-    };
-
     let mon = screen.monitor_rect;
-    let state = Box::new(OverlayState {
-        screen,
-        bmp_bright,
-        bmp_dim,
-        font_ui,
-        has_selection: false,
-        sel: RECT::default(),
-        drag_mode: DragMode::None,
-        anchor: POINT::default(),
-        orig_sel: RECT::default(),
-        hover_btn: None,
-        buttons: Vec::new(),
-        on_close_cb: Some(Box::new(on_close)),
-    });
+    let state = Box::new(build_overlay_state(screen, Some(Box::new(on_close))));
     let state_ptr = Box::into_raw(state);
 
     let class_name: Vec<u16> = "HdrSnipOverlayWnd\0".encode_utf16().collect();
@@ -358,7 +1141,6 @@ pub fn show_overlay(screen: CapturedScreen, on_close: impl FnOnce() + 'static) {
             let _ = SetForegroundWindow(hwnd);
             let _ = SetFocus(hwnd);
         } else {
-            // Reclaim state if window creation failed
             let _ = Box::from_raw(state_ptr);
         }
     }
@@ -387,9 +1169,8 @@ fn execute_action(hwnd: HWND, st: &mut OverlayState, action: ToolbarBtn) {
         ToolbarBtn::Save => {
             if st.sel_valid() {
                 let r = st.normalized_sel();
-                // Hide topmost overlay momentarily so Save dialog is unobstructed
                 unsafe {
-                    let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
                 }
                 if let Some(path) = prompt_save_png_dialog(HWND::default()) {
                     let _ = save_crop_png(&st.screen, r, &path);
@@ -427,197 +1208,17 @@ fn paint_overlay(hwnd: HWND, st: &OverlayState) {
         let w = st.screen.width as i32;
         let h = st.screen.height as i32;
 
-        // Offscreen double buffer (zero flicker)
         let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
-        let old_mem = SelectObject(mem_dc, mem_bmp);
-
+        let old_mem = SelectObject(mem_dc, st.bmp_back);
         let src_dc = CreateCompatibleDC(hdc);
-        // 1) Dimmed full screen
-        let old_src = SelectObject(src_dc, st.bmp_dim);
-        let _ = BitBlt(mem_dc, 0, 0, w, h, src_dc, 0, 0, SRCCOPY);
 
-        // 2) Bright cropped selection
-        if st.sel_valid() {
-            let r = st.normalized_sel();
-            SelectObject(src_dc, st.bmp_bright);
-            let _ = BitBlt(
-                mem_dc,
-                r.left,
-                r.top,
-                r.right - r.left,
-                r.bottom - r.top,
-                src_dc,
-                r.left,
-                r.top,
-                SRCCOPY,
-            );
+        st.render_frame(mem_dc, src_dc);
 
-            // Selection border (crisp sky-blue + white inner highlight)
-            let pen_outer: HPEN = CreatePen(PS_SOLID, 2, COLORREF(0x00F8BD38)); // #38BDF8 sky
-            let old_pen = SelectObject(mem_dc, pen_outer);
-            let old_brush = SelectObject(
-                mem_dc,
-                windows::Win32::Graphics::Gdi::GetStockObject(NULL_BRUSH),
-            );
-            let _ = Rectangle(mem_dc, r.left, r.top, r.right, r.bottom);
-            SelectObject(mem_dc, old_brush);
-            SelectObject(mem_dc, old_pen);
-            let _ = DeleteObject(pen_outer);
-
-            // 8 resize handles
-            let handle_brush: HBRUSH = CreateSolidBrush(COLORREF(0x00FFFFFF));
-            let handle_pen: HPEN = CreatePen(PS_SOLID, 1, COLORREF(0x00E5464F));
-            let op = SelectObject(mem_dc, handle_pen);
-            let ob = SelectObject(mem_dc, handle_brush);
-            let mx = (r.left + r.right) / 2;
-            let my = (r.top + r.bottom) / 2;
-            for (hx, hy) in [
-                (r.left, r.top),
-                (mx, r.top),
-                (r.right, r.top),
-                (r.right, my),
-                (r.right, r.bottom),
-                (mx, r.bottom),
-                (r.left, r.bottom),
-                (r.left, my),
-            ] {
-                let _ = Rectangle(mem_dc, hx - 4, hy - 4, hx + 5, hy + 5);
-            }
-            SelectObject(mem_dc, ob);
-            SelectObject(mem_dc, op);
-            let _ = DeleteObject(handle_brush);
-            let _ = DeleteObject(handle_pen);
-
-            // Dimensions pill (e.g. "842 × 416 · HDR 240 nits")
-            let dim_text = if st.screen.hdr_info.hdr_enabled {
-                format!(
-                    "{} × {}  ·  HDR→sRGB",
-                    r.right - r.left,
-                    r.bottom - r.top
-                )
-            } else {
-                format!("{} × {}", r.right - r.left, r.bottom - r.top)
-            };
-            let pill_w = 172;
-            let pill_h = 24;
-            let px = r.left.clamp(8, (w - pill_w - 8).max(8));
-            let py = if r.top >= pill_h + 8 {
-                r.top - pill_h - 6
-            } else {
-                r.top + 6
-            };
-            let pill_rect = RECT {
-                left: px,
-                top: py,
-                right: px + pill_w,
-                bottom: py + pill_h,
-            };
-            let pill_bg = CreateSolidBrush(COLORREF(0x00221811));
-            let pill_pen = CreatePen(PS_SOLID, 1, COLORREF(0x00524133));
-            let op2 = SelectObject(mem_dc, pill_pen);
-            let ob2 = SelectObject(mem_dc, pill_bg);
-            let _ = RoundRect(mem_dc, pill_rect.left, pill_rect.top, pill_rect.right, pill_rect.bottom, 8, 8);
-            SelectObject(mem_dc, ob2);
-            SelectObject(mem_dc, op2);
-            let _ = DeleteObject(pill_bg);
-            let _ = DeleteObject(pill_pen);
-
-            let old_font = SelectObject(mem_dc, st.font_ui);
-            SetBkMode(mem_dc, TRANSPARENT);
-            SetTextColor(mem_dc, COLORREF(0x00F5EFEA));
-            let mut dim_wide: Vec<u16> = dim_text.encode_utf16().collect();
-            let mut tr = pill_rect;
-            DrawTextW(mem_dc, &mut dim_wide, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(mem_dc, old_font);
-        } else {
-            // Top hint bar when no selection yet
-            let hint = "Arraste para recortar  ·  F = Tela toda  ·  Esc = Cancelar";
-            let hw = 430;
-            let hh = 34;
-            let hx = (w - hw) / 2;
-            let hy = 22;
-            let hr = RECT {
-                left: hx,
-                top: hy,
-                right: hx + hw,
-                bottom: hy + hh,
-            };
-            let bg = CreateSolidBrush(COLORREF(0x00241A12));
-            let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00F8BD38));
-            let op = SelectObject(mem_dc, pen);
-            let ob = SelectObject(mem_dc, bg);
-            let _ = RoundRect(mem_dc, hr.left, hr.top, hr.right, hr.bottom, 10, 10);
-            SelectObject(mem_dc, ob);
-            SelectObject(mem_dc, op);
-            let _ = DeleteObject(bg);
-            let _ = DeleteObject(pen);
-
-            let old_font = SelectObject(mem_dc, st.font_ui);
-            SetBkMode(mem_dc, TRANSPARENT);
-            SetTextColor(mem_dc, COLORREF(0x00FFFFFF));
-            let mut wide: Vec<u16> = hint.encode_utf16().collect();
-            let mut tr = hr;
-            DrawTextW(mem_dc, &mut wide, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(mem_dc, old_font);
-        }
-
-        // 3) Floating Lightshot-style toolbar
-        if !st.buttons.is_empty() {
-            let min_l = st.buttons.iter().map(|b| b.rect.left).min().unwrap_or(0) - 8;
-            let min_t = st.buttons.iter().map(|b| b.rect.top).min().unwrap_or(0) - 6;
-            let max_r = st.buttons.iter().map(|b| b.rect.right).max().unwrap_or(0) + 8;
-            let max_b = st.buttons.iter().map(|b| b.rect.bottom).max().unwrap_or(0) + 6;
-
-            let bar_bg = CreateSolidBrush(COLORREF(0x001E1711)); // dark slate
-            let bar_pen = CreatePen(PS_SOLID, 1, COLORREF(0x00584534));
-            let op = SelectObject(mem_dc, bar_pen);
-            let ob = SelectObject(mem_dc, bar_bg);
-            let _ = RoundRect(mem_dc, min_l, min_t, max_r, max_b, 10, 10);
-            SelectObject(mem_dc, ob);
-            SelectObject(mem_dc, op);
-            let _ = DeleteObject(bar_bg);
-            let _ = DeleteObject(bar_pen);
-
-            let old_font = SelectObject(mem_dc, st.font_ui);
-            SetBkMode(mem_dc, TRANSPARENT);
-
-            for b in &st.buttons {
-                let hovered = st.hover_btn == Some(b.kind);
-                let fill_col = match (b.kind, hovered) {
-                    (ToolbarBtn::Copy, true) => COLORREF(0x00F16663),  // indigo bright
-                    (ToolbarBtn::Copy, false) => COLORREF(0x00E5464F), // indigo primary
-                    (ToolbarBtn::Cancel, true) => COLORREF(0x003D3399),
-                    (_, true) => COLORREF(0x00463729),
-                    (_, false) => COLORREF(0x0031251B),
-                };
-                let bb = CreateSolidBrush(fill_col);
-                let bp = CreatePen(PS_SOLID, 1, COLORREF(0x00665240));
-                let op2 = SelectObject(mem_dc, bp);
-                let ob2 = SelectObject(mem_dc, bb);
-                let _ = RoundRect(mem_dc, b.rect.left, b.rect.top, b.rect.right, b.rect.bottom, 7, 7);
-                SelectObject(mem_dc, ob2);
-                SelectObject(mem_dc, op2);
-                let _ = DeleteObject(bb);
-                let _ = DeleteObject(bp);
-
-                SetTextColor(mem_dc, COLORREF(0x00FFFFFF));
-                let mut wide: Vec<u16> = b.label.encode_utf16().collect();
-                let mut tr = b.rect;
-                DrawTextW(mem_dc, &mut wide, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            }
-            SelectObject(mem_dc, old_font);
-        }
-
-        // Copy backbuffer to screen in 1 blit
         let _ = BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
 
-        SelectObject(src_dc, old_src);
         let _ = DeleteDC(src_dc);
         SelectObject(mem_dc, old_mem);
-        let _ = DeleteObject(mem_bmp);
         let _ = DeleteDC(mem_dc);
-        let _ = FillRect(HDC::default(), &RECT::default(), HBRUSH::default());
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -650,7 +1251,7 @@ unsafe extern "system" fn overlay_wnd_proc(
         WM_SETCURSOR => {
             if let Some(st) = get_state(hwnd) {
                 let mut pt = POINT::default();
-                let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+                let _ = GetCursorPos(&mut pt);
                 let x = pt.x - st.screen.monitor_rect.left;
                 let y = pt.y - st.screen.monitor_rect.top;
                 let cur_id = if st.hit_toolbar(x, y).is_some() {
@@ -820,14 +1421,13 @@ unsafe extern "system" fn overlay_wnd_proc(
         WM_KEYDOWN => {
             if let Some(st) = get_state(hwnd) {
                 let vk = wparam.0 as u16;
-                let ctrl = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
                 if vk == VK_ESCAPE.0 {
                     execute_action(hwnd, st, ToolbarBtn::Cancel);
-                } else if vk == VK_RETURN.0 || (ctrl && vk == VK_C.0) {
+                } else if vk == VK_RETURN.0 || vk == VK_C.0 {
                     if st.sel_valid() {
                         execute_action(hwnd, st, ToolbarBtn::Copy);
                     }
-                } else if ctrl && vk == VK_S.0 {
+                } else if vk == VK_S.0 {
                     if st.sel_valid() {
                         execute_action(hwnd, st, ToolbarBtn::Save);
                     }
@@ -848,6 +1448,3 @@ unsafe extern "system" fn overlay_wnd_proc(
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
-
-#[allow(dead_code)]
-fn _unused_gdi_marker(_: HGDIOBJ) {}

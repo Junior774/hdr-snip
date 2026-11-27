@@ -6,6 +6,7 @@
 mod capture;
 mod clipboard;
 mod overlay;
+mod ui_draw;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, Ordering};
@@ -331,6 +332,23 @@ fn main() {
 
     // CLI self-test mode: `hdr-snip.exe --test-capture <output.png>` (captures full screen and exits)
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--test-ui" {
+        let out_path = PathBuf::from(&args[2]);
+        match capture::capture_active_monitor() {
+            Ok(screen) => {
+                if let Err(e) = overlay::render_ui_preview_png(screen, &out_path) {
+                    eprintln!("PREVIEW_ERR: {e}");
+                    std::process::exit(2);
+                }
+                println!("OK_PREVIEW {}", out_path.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("CAPTURE_ERR: {e:?}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.len() >= 3 && args[1] == "--test-capture" {
         let out_path = PathBuf::from(&args[2]);
         match capture::capture_active_monitor() {
